@@ -362,19 +362,23 @@
   let pulseRAF = null;
 
   // Build a fresh segment state object for a pulse just entering `tile` from
-  // world side `worldEnter`. Returns null if the entry isn't a real ribbon arc
-  // (shouldn't happen, but guards against corruption).
+  // world side `worldEnter`. We store LOCAL sides only — `worldExit` is computed
+  // on demand from the tile's CURRENT rotation so that rotating a tile under a
+  // pulse keeps the pulse glued to its segment (lEnter/lExit/arcName don't
+  // change with rotation; only the world-frame mapping does).
   function segmentStateFor(tile, worldEnter) {
     const arcName = arcAtSide(tile.rotDeg, worldEnter);
     if (!arcName) return null;
     const u = rotUnit(tile.rotDeg);
     const lEnter = ((worldEnter - u) % 6 + 6) % 6;
-    const worldExit = partnerSide(tile.rotDeg, worldEnter);
-    const lExit = ((worldExit - u) % 6 + 6) % 6;
+    const lExit = BASE_PARTNER[lEnter];
     return {
-      tile, arcName, lEnter, lExit, worldExit,
+      tile, arcName, lEnter, lExit,
       segLen: ARC_GEOM[arcName].length,
     };
+  }
+  function pulseWorldExit(p) {
+    return (p.lExit + rotUnit(p.tile.rotDeg)) % 6;
   }
 
   function emitPulse(startSide) {
@@ -419,12 +423,15 @@
       let dead = false;
       while (p.s >= p.segLen) {
         const overshoot = p.s - p.segLen;
-        // Step into the next tile via the current segment's worldExit.
-        const [nc, nr] = neighborOf(p.tile.col, p.tile.row, p.worldExit);
+        // Compute worldExit FRESH from the tile's current rotation, so any
+        // rotations applied to this tile while the pulse was mid-segment route
+        // the pulse out through the now-correct world side.
+        const worldExit = pulseWorldExit(p);
+        const [nc, nr] = neighborOf(p.tile.col, p.tile.row, worldExit);
         if (m && nc === m.col && nr === m.row) { dead = true; break; }
         const nt = tiles.get(nc + "," + nr);
         if (!nt) { dead = true; break; }
-        const worldEnter = (p.worldExit + 3) % 6;
+        const worldEnter = (worldExit + 3) % 6;
         const nextSeg = segmentStateFor(nt, worldEnter);
         if (!nextSeg) { dead = true; break; }
         // Apply the transition.
@@ -432,7 +439,6 @@
         p.arcName = nextSeg.arcName;
         p.lEnter = nextSeg.lEnter;
         p.lExit = nextSeg.lExit;
-        p.worldExit = nextSeg.worldExit;
         p.segLen = nextSeg.segLen;
         p.s = overshoot;
         placePulseInTile(p.circle, p.tile, p.arcName);
