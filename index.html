@@ -45,7 +45,7 @@
 <div id="mode-banner"></div>
 <script>
 (() => {
-  const APP_VERSION = "v7-breathe-slower-33pct-2026-05-25-2110";
+  const APP_VERSION = "v8-breathe-ease-out-2026-05-25-2115";
   console.log("hexwar app version:", APP_VERSION);
   const SVG_NS = "http://www.w3.org/2000/svg";
   const svg = document.getElementById("field");
@@ -356,8 +356,46 @@
     }
     colorize();
 
+    // Stop the breathe animation by easing each node-dot from its CURRENT
+    // scale back to 1 over half a breathe cycle (~900ms), matching the
+    // regular animation pacing. Without this, removing the `searching`
+    // class snaps the dots back to scale(1) instantly.
+    const dots = document.querySelectorAll(".color-nodes .node-dot");
+    const captured = [];
+    for (const d of dots) {
+      const t = getComputedStyle(d).transform;
+      let sx = 1;
+      if (t && t !== "none") {
+        try { sx = new DOMMatrixReadOnly(t).a; } catch (e) { sx = 1; }
+      }
+      captured.push([d, sx]);
+    }
+    // Pin each dot to its current scale via inline style, then drop the
+    // animation class. Inline transform takes over once the animation is
+    // removed, so there's no visible jump.
+    for (const [d, sx] of captured) {
+      d.style.transition = "transform 0s";
+      d.style.transform = `scale(${sx})`;
+    }
+    // Force layout so the pinned scale is committed before we switch.
+    void document.body.offsetHeight;
     document.body.classList.remove("searching");
     searching = false;
+    // Next frame: enable the easing transition and target scale(1).
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      for (const [d] of captured) {
+        d.style.transition = "transform 900ms ease-in-out";
+        d.style.transform = "scale(1)";
+      }
+    }));
+    // Clean up inline styles after the ease-out finishes so future
+    // searches start from a clean slate.
+    setTimeout(() => {
+      for (const [d] of captured) {
+        d.style.transition = "";
+        d.style.transform = "";
+      }
+    }, 1100);
     updateModeBanner(modeIdx, everBest, `${iters} trials, +${improvements}`);
     console.log(`search mode=${modeIdx} (${mode.name}): iters=${iters} improvements=${improvements} perturbations=${perturbations} restored=${restored} score=${everBest}`);
   }
