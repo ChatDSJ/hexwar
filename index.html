@@ -1,0 +1,500 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Hex Tile Graph</title>
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<style>
+  :root {
+    --bg: #ECE6D6;
+    --band: #9C9587;
+    --band-edge: #3a362e;
+    --hex-stroke: rgba(58,54,46,0.18);
+    --hex-stroke-magic: rgba(58,54,46,0.65);
+  }
+  html, body { margin: 0; padding: 0; height: 100%; background: var(--bg); overflow: hidden; overscroll-behavior: none; }
+  body { font-family: system-ui, sans-serif; -webkit-tap-highlight-color: transparent; }
+  svg#field { display: block; width: 100vw; height: 100vh; cursor: pointer; touch-action: none; user-select: none; -webkit-user-select: none; }
+  .drag-rect { pointer-events: none; }
+  .tile-inner { transition: transform 450ms cubic-bezier(.22,.61,.36,1); transform-origin: 0 0; will-change: transform; }
+  .tile { cursor: pointer; }
+  .tile:hover .hex-outline { stroke: rgba(58,54,46,0.42); }
+  .hex-outline { transition: stroke 200ms ease; }
+  .ribbon { transition: fill 420ms ease; }
+  .node-dot { transition: fill 420ms ease; }
+</style>
+</head>
+<body>
+<svg id="field" xmlns="http://www.w3.org/2000/svg"></svg>
+<script>
+(() => {
+  const SVG_NS = "http://www.w3.org/2000/svg";
+  const svg = document.getElementById("field");
+
+  // ---------- Tile geometry (flat-top hexagon, math coords; SVG y is down) ----------
+  const R = 26;                  // outer hex circumradius (px)
+  const RIBBON = R * 0.18;       // band width
+  const BAND_FILL = getComputedStyle(document.documentElement).getPropertyValue("--band").trim();
+  const BAND_EDGE = getComputedStyle(document.documentElement).getPropertyValue("--band-edge").trim();
+  const HEX_STROKE = getComputedStyle(document.documentElement).getPropertyValue("--hex-stroke").trim();
+  const HEX_STROKE_MAGIC = getComputedStyle(document.documentElement).getPropertyValue("--hex-stroke-magic").trim();
+  const BG = getComputedStyle(document.documentElement).getPropertyValue("--bg").trim();
+
+  // ROYGBV palette
+  const COLORS = ["#D8453C", "#E58A2A", "#E6C72E", "#3FA956", "#3677CC", "#7A48A8"];
+
+  // Vertices V[0..5] at angles 0, 60, 120, ...
+  const V = [];
+  for (let i = 0; i < 6; i++) {
+    V.push([R * Math.cos((Math.PI / 3) * i), R * Math.sin((Math.PI / 3) * i)]);
+  }
+  // Side midpoints (0-indexed): side s is between V[s] and V[(s+1)%6]
+  const MID = [];
+  for (let s = 0; s < 6; s++) {
+    const a = V[s], b = V[(s + 1) % 6];
+    MID.push([(a[0] + b[0]) / 2, (a[1] + b[1]) / 2]);
+  }
+  // 1-indexed alias (legacy): M(k) = MID[k-1]
+  const M = (k) => MID[((k - 1) % 6 + 6) % 6];
+
+  const sub = (p, q) => [p[0] - q[0], p[1] - q[1]];
+  const angle = (p) => Math.atan2(p[1], p[0]);
+  const len = (p) => Math.hypot(p[0], p[1]);
+
+  function arcPoints(c, r, a1, a2, steps = 56) {
+    if (a2 < a1) a2 += 2 * Math.PI;
+    const pts = [];
+    for (let t = 0; t <= steps; t++) {
+      const a = a1 + (a2 - a1) * (t / steps);
+      pts.push([c[0] + r * Math.cos(a), c[1] + r * Math.sin(a)]);
+    }
+    return pts;
+  }
+
+  function ribbonPath(center, r, a1, a2, width, steps = 56) {
+    const rOut = r + width / 2;
+    const rIn = r - width / 2;
+    const outer = arcPoints(center, rOut, a1, a2, steps);
+    const inner = arcPoints(center, rIn, a1, a2, steps).reverse();
+    const pts = outer.concat(inner);
+    return "M" + pts.map((p) => p[0].toFixed(2) + "," + p[1].toFixed(2)).join(" L") + " Z";
+  }
+
+  function shortArcAngles(center, p1, p2) {
+    let a1 = angle(sub(p1, center));
+    let a2 = angle(sub(p2, center));
+    const d = ((a2 - a1) % (2 * Math.PI) + 2 * Math.PI) % (2 * Math.PI);
+    if (d > Math.PI) [a1, a2] = [a2, a1];
+    return [a1, a2];
+  }
+
+  // Arc A: M(1) <-> M(2), center = V[1], radius = R/2, 120° sweep
+  function arcA() {
+    const center = V[1];
+    const r = R / 2;
+    const [a1, a2] = shortArcAngles(center, M(1), M(2));
+    return { center, r, a1, a2 };
+  }
+
+  function arc60FarSide(p1, p2) {
+    const mid = [(p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2];
+    const chord = sub(p2, p1);
+    const cLen = len(chord);
+    const perp = [-chord[1] / cLen, chord[0] / cLen];
+    const r = cLen;
+    const d = r * Math.cos(Math.PI / 6);
+    const c1 = [mid[0] + perp[0] * d, mid[1] + perp[1] * d];
+    const c2 = [mid[0] - perp[0] * d, mid[1] - perp[1] * d];
+    const center = len(c1) > len(c2) ? c1 : c2;
+    const [a1, a2] = shortArcAngles(center, p1, p2);
+    return { center, r, a1, a2 };
+  }
+
+  function arcB() { return arc60FarSide(M(3), M(5)); }
+  function arcC() { return arc60FarSide(M(4), M(6)); }
+
+  const A = arcA(), B = arcB(), C = arcC();
+  const pathA = ribbonPath(A.center, A.r, A.a1, A.a2, RIBBON);
+  const pathB = ribbonPath(B.center, B.r, B.a1, B.a2, RIBBON);
+  const pathC = ribbonPath(C.center, C.r, C.a1, C.a2, RIBBON);
+
+  const hexPts = V.map(p => p[0].toFixed(2) + "," + p[1].toFixed(2)).join(" ");
+
+  // ---------- Topology ----------
+  // Local-frame (rotation 0) arc partners, 0-indexed sides:
+  //   A connects sides {0,1};  B connects {2,4};  C connects {3,5}.
+  const BASE_PARTNER = { 0: 1, 1: 0, 2: 4, 4: 2, 3: 5, 5: 3 };
+  const ARC_OF_LOCAL = { 0: "A", 1: "A", 2: "B", 4: "B", 3: "C", 5: "C" };
+
+  // For a tile rotated by `rotUnit` (in units of 60° CW on screen), a world-frame
+  // side `s` corresponds to local side ((s - rotUnit) mod 6). The arc going through
+  // that side connects to a world-frame partner side.
+  function rotUnit(rotDeg) { return (((rotDeg / 60) % 6) + 6) % 6; }
+  function partnerSide(rotDeg, worldSide) {
+    const u = rotUnit(rotDeg);
+    const local = ((worldSide - u) % 6 + 6) % 6;
+    const localPartner = BASE_PARTNER[local];
+    return ((localPartner + u) % 6 + 6) % 6;
+  }
+  function arcAtSide(rotDeg, worldSide) {
+    const u = rotUnit(rotDeg);
+    const local = ((worldSide - u) % 6 + 6) % 6;
+    return ARC_OF_LOCAL[local];
+  }
+
+  // Flat-top neighbor offsets per world-frame side index (side 0 is the right-most
+  // side, going CCW in math / CW on screen due to SVG y-down).
+  // Side midpoints in SVG units: MID[0]=(3R/4,R√3/4), [1]=(0,R√3/2), [2]=(-3R/4,R√3/4),
+  //   [3]=(-3R/4,-R√3/4), [4]=(0,-R√3/2), [5]=(3R/4,-R√3/4).
+  // Grid: dx=1.5R, dy=√3 R, odd cols shifted +dy/2.
+  // Even col (no shift):
+  const NEIGHBOR_EVEN = [[+1, 0], [0, +1], [-1, 0], [-1, -1], [0, -1], [+1, -1]];
+  // Odd col (shifted +dy/2):
+  const NEIGHBOR_ODD = [[+1, +1], [0, +1], [-1, +1], [-1, 0], [0, -1], [+1, 0]];
+  function neighborOf(col, row, side) {
+    const offs = (Math.abs(col) % 2 === 1) ? NEIGHBOR_ODD : NEIGHBOR_EVEN;
+    const [dc, dr] = offs[side];
+    return [col + dc, row + dr];
+  }
+
+  // ---------- Tile factory ----------
+  function makeTile(cx, cy, rotDeg, col, row) {
+    const g = document.createElementNS(SVG_NS, "g");
+    g.setAttribute("class", "tile");
+    g.setAttribute("transform", `translate(${cx} ${cy})`);
+
+    const inner = document.createElementNS(SVG_NS, "g");
+    inner.setAttribute("class", "tile-inner");
+    inner.style.transform = `rotate(${rotDeg}deg)`;
+    g.appendChild(inner);
+
+    const hex = document.createElementNS(SVG_NS, "polygon");
+    hex.setAttribute("points", hexPts);
+    hex.setAttribute("fill", BG);
+    hex.setAttribute("stroke", HEX_STROKE);
+    hex.setAttribute("stroke-width", "1");
+    hex.setAttribute("stroke-linejoin", "round");
+    hex.setAttribute("class", "hex-outline");
+    inner.appendChild(hex);
+
+    function ribbon(d) {
+      const path = document.createElementNS(SVG_NS, "path");
+      path.setAttribute("d", d);
+      path.setAttribute("fill", BAND_FILL);
+      path.setAttribute("stroke", BAND_EDGE);
+      path.setAttribute("stroke-width", "1.2");
+      path.setAttribute("stroke-linejoin", "round");
+      path.setAttribute("class", "ribbon");
+      inner.appendChild(path);
+      return path;
+    }
+
+    // Draw order: C under, halo, B over, A on top.
+    const arcCEl = ribbon(pathC);
+    const halo = document.createElementNS(SVG_NS, "path");
+    halo.setAttribute("d", pathB);
+    halo.setAttribute("fill", BG);
+    halo.setAttribute("stroke", BG);
+    halo.setAttribute("stroke-width", "3");
+    halo.setAttribute("stroke-linejoin", "round");
+    inner.appendChild(halo);
+    const arcBEl = ribbon(pathB);
+    const arcAEl = ribbon(pathA);
+
+    const tile = {
+      col, row, cx, cy, group: g, inner,
+      rotDeg,
+      arcs: { A: arcAEl, B: arcBEl, C: arcCEl },
+      isMagic: false,
+      colorNodes: null, // populated when marked magic
+    };
+    g.__tileObj = tile;
+    return tile;
+  }
+
+  // Rotate a single tile by +60° (clockwise on screen).
+  function rotateTile(t) {
+    t.rotDeg += 60;
+    t.inner.style.transform = `rotate(${t.rotDeg}deg)`;
+    rotationByCell.set(t.col + "," + t.row, ((t.rotDeg % 360) + 360) % 360);
+  }
+
+  // Promote a tile to the magic tile: strip its internal ribbons (the magic tile
+  // has none — only color nodes), emphasize the hex outline, and add 6 color-node
+  // circles outside the rotating inner-g (side midpoints are 60°-rotationally
+  // symmetric, so they sit at the same screen positions regardless of rotation).
+  function makeMagic(tile) {
+    tile.isMagic = true;
+    // strip ribbons / halo from inner; keep only the hex outline
+    Array.from(tile.inner.children).forEach((el) => {
+      if (!el.classList.contains("hex-outline")) tile.inner.removeChild(el);
+    });
+    tile.arcs = { A: null, B: null, C: null };
+    // emphasize the hex outline
+    const hex = tile.inner.querySelector(".hex-outline");
+    hex.setAttribute("stroke", HEX_STROKE_MAGIC);
+    hex.setAttribute("stroke-width", "1.6");
+
+    // outer dots layer (not rotating)
+    const dotsG = document.createElementNS(SVG_NS, "g");
+    dotsG.setAttribute("class", "color-nodes");
+    const dots = [];
+    const inset = 0.78; // pull dot inward from edge
+    const dotR = Math.max(2.6, RIBBON * 1.05);
+    for (let s = 0; s < 6; s++) {
+      const [mx, my] = MID[s];
+      const cx = mx * inset, cy = my * inset;
+      const dot = document.createElementNS(SVG_NS, "circle");
+      dot.setAttribute("cx", cx.toFixed(2));
+      dot.setAttribute("cy", cy.toFixed(2));
+      dot.setAttribute("r", dotR);
+      dot.setAttribute("fill", "#ffffff");
+      dot.setAttribute("stroke", BAND_EDGE);
+      dot.setAttribute("stroke-width", "1.2");
+      dot.setAttribute("class", "node-dot");
+      dotsG.appendChild(dot);
+      dots.push(dot);
+    }
+    tile.group.appendChild(dotsG);
+    tile.colorNodes = dots;
+  }
+
+  // ---------- Coloring (re-runs on every redraw / click) ----------
+  // Per spec interpretation (a):
+  //   Pick an uncolored color node on the magic tile, assign next ROYGBV color.
+  //   Trace the ribbon strand starting by exiting the magic tile through that side.
+  //   Color every ribbon arc along the way. When the trace returns to the magic
+  //   tile at some side Nk, also color the magic-tile arc reaching Nk and that
+  //   node, then stop. If the trace runs off-grid, stop. Repeat.
+  function colorize() {
+    if (!magicKey) return;
+    const magicTile = tiles.get(magicKey);
+    if (!magicTile) return;
+
+    // Reset all ribbon fills to default (skip the magic tile — it has no ribbons)
+    for (const t of tiles.values()) {
+      if (t.isMagic) continue;
+      for (const k of ["A", "B", "C"]) t.arcs[k].setAttribute("fill", BAND_FILL);
+    }
+    const nodeColors = [null, null, null, null, null, null];
+    let nextColor = 0;
+
+    for (let startSide = 0; startSide < 6; startSide++) {
+      if (nodeColors[startSide] !== null) continue;
+      if (nextColor >= COLORS.length) break;
+      const color = COLORS[nextColor++];
+      nodeColors[startSide] = color;
+
+      // Exit the magic tile through `startSide`.  We do NOT color the magic tile's
+      // internal arc connected to startSide (interpretation (a) keeps the magic
+      // interior neutral); we only walk outward.
+      let exitSide = startSide;
+      let c = magicTile.col, r = magicTile.row;
+      const visited = new Set();
+      // Cap on trace length to avoid pathologies (huge grids should still terminate
+      // by either return-to-magic, off-grid, or loop, but this is a safety belt).
+      let steps = 0;
+      const STEP_CAP = 50000;
+
+      while (steps++ < STEP_CAP) {
+        const [nc, nr] = neighborOf(c, r, exitSide);
+        const enterSide = (exitSide + 3) % 6;
+
+        // Did we re-enter the magic tile?
+        if (nc === magicTile.col && nr === magicTile.row) {
+          // Magic tile has no internal ribbons — just color the destination node.
+          if (nodeColors[enterSide] === null) nodeColors[enterSide] = color;
+          break;
+        }
+
+        const nKey = nc + "," + nr;
+        const nt = tiles.get(nKey);
+        if (!nt) break; // ran off the grid
+
+        // Loop detection: (tile, enterSide) seen before -> stop
+        const visitKey = nKey + "|" + enterSide;
+        if (visited.has(visitKey)) break;
+        visited.add(visitKey);
+
+        // Color this arc and continue.
+        const arcName = arcAtSide(nt.rotDeg, enterSide);
+        nt.arcs[arcName].setAttribute("fill", color);
+        const nextExit = partnerSide(nt.rotDeg, enterSide);
+        c = nc; r = nr; exitSide = nextExit;
+      }
+    }
+
+    // Apply color-node dot fills
+    for (let s = 0; s < 6; s++) {
+      const dot = magicTile.colorNodes[s];
+      dot.setAttribute("fill", nodeColors[s] || "#ffffff");
+    }
+  }
+
+  // ---------- Layout ----------
+  const dx = 1.5 * R;
+  const dy = Math.sqrt(3) * R;
+
+  const rotationByCell = new Map();
+  function getRotation(col, row) {
+    const k = col + "," + row;
+    if (!rotationByCell.has(k)) {
+      rotationByCell.set(k, 60 * Math.floor(Math.random() * 6));
+    }
+    return rotationByCell.get(k);
+  }
+
+  // Tracks current tiles keyed "col,row"
+  const tiles = new Map();
+  let magicKey = null;
+
+  function build() {
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+    tiles.clear();
+
+    const W = window.innerWidth;
+    const H = window.innerHeight;
+    svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+    svg.setAttribute("width", W);
+    svg.setAttribute("height", H);
+
+    const colMin = Math.floor((-R) / dx) - 1;
+    const colMax = Math.ceil((W + R) / dx) + 1;
+    const rowMin = Math.floor((-R) / dy) - 1;
+    const rowMax = Math.ceil((H + R) / dy) + 1;
+
+    let bestKey = null, bestD = Infinity;
+    const cxCenter = W / 2, cyCenter = H / 2;
+
+    const frag = document.createDocumentFragment();
+    for (let col = colMin; col <= colMax; col++) {
+      const xShift = (Math.abs(col) % 2 === 1) ? dy / 2 : 0;
+      for (let row = rowMin; row <= rowMax; row++) {
+        const cx = col * dx;
+        const cy = row * dy + xShift;
+        if (cx < -R - 2 || cx > W + R + 2) continue;
+        if (cy < -R - 2 || cy > H + R + 2) continue;
+        const t = makeTile(cx, cy, getRotation(col, row), col, row);
+        tiles.set(col + "," + row, t);
+        frag.appendChild(t.group);
+        // Track closest tile to viewport center for the magic role
+        const dxC = cx - cxCenter, dyC = cy - cyCenter;
+        const d = dxC * dxC + dyC * dyC;
+        if (d < bestD) { bestD = d; bestKey = col + "," + row; }
+      }
+    }
+    svg.appendChild(frag);
+
+    // Promote center tile to magic, append its dots layer last (so they render last).
+    magicKey = bestKey;
+    if (magicKey) {
+      const magicTile = tiles.get(magicKey);
+      makeMagic(magicTile);
+      // Lift magic tile to end of svg children so its color dots render on top of
+      // any neighboring ribbons.
+      svg.appendChild(magicTile.group);
+    }
+
+    colorize();
+  }
+
+  build();
+
+  let resizeTimer = null;
+  window.addEventListener("resize", () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(build, 100);
+  });
+
+  // ---------- Pointer interaction: click a tile, OR drag a bounding box ----------
+  // - tap/click  → rotate that single tile by +60°.
+  // - drag rect  → rotate every tile whose center is inside the rect.
+  const DRAG_THRESHOLD = 5; // pixels before a press becomes a drag
+
+  let drag = null; // {pointerId, startX, startY, startTile, isDrag, rectEl}
+
+  function clientToSvg(clientX, clientY) {
+    // SVG fills viewport with viewBox=0..W,0..H matching innerWidth/innerHeight,
+    // and the SVG is positioned at (0,0). So clientX/Y == SVG units.
+    return [clientX, clientY];
+  }
+
+  svg.addEventListener("pointerdown", (e) => {
+    if (e.pointerType === "mouse" && e.button !== 0) return;
+    e.preventDefault();
+    try { svg.setPointerCapture(e.pointerId); } catch (_) {}
+    const target = e.target.closest("g.tile");
+    const [sx, sy] = clientToSvg(e.clientX, e.clientY);
+    drag = {
+      pointerId: e.pointerId,
+      startX: sx, startY: sy,
+      startTile: target ? target.__tileObj : null,
+      isDrag: false,
+      rectEl: null,
+    };
+  });
+
+  svg.addEventListener("pointermove", (e) => {
+    if (!drag || e.pointerId !== drag.pointerId) return;
+    const [cx, cy] = clientToSvg(e.clientX, e.clientY);
+    const dx = cx - drag.startX, dy = cy - drag.startY;
+    if (!drag.isDrag && Math.hypot(dx, dy) >= DRAG_THRESHOLD) {
+      drag.isDrag = true;
+      const r = document.createElementNS(SVG_NS, "rect");
+      r.setAttribute("class", "drag-rect");
+      r.setAttribute("fill", "rgba(58,54,46,0.08)");
+      r.setAttribute("stroke", "rgba(58,54,46,0.85)");
+      r.setAttribute("stroke-width", "1.4");
+      r.setAttribute("stroke-dasharray", "5,4");
+      svg.appendChild(r);
+      drag.rectEl = r;
+    }
+    if (drag.isDrag) {
+      const x = Math.min(drag.startX, cx);
+      const y = Math.min(drag.startY, cy);
+      drag.rectEl.setAttribute("x", x.toFixed(1));
+      drag.rectEl.setAttribute("y", y.toFixed(1));
+      drag.rectEl.setAttribute("width", Math.abs(dx).toFixed(1));
+      drag.rectEl.setAttribute("height", Math.abs(dy).toFixed(1));
+    }
+  });
+
+  function endDrag(e) {
+    if (!drag || (e && e.pointerId !== drag.pointerId)) return;
+    try { svg.releasePointerCapture(drag.pointerId); } catch (_) {}
+
+    if (drag.isDrag) {
+      const ex = e ? e.clientX : drag.startX;
+      const ey = e ? e.clientY : drag.startY;
+      const x1 = Math.min(drag.startX, ex);
+      const y1 = Math.min(drag.startY, ey);
+      const x2 = Math.max(drag.startX, ex);
+      const y2 = Math.max(drag.startY, ey);
+      let any = false;
+      for (const t of tiles.values()) {
+        if (t.cx >= x1 && t.cx <= x2 && t.cy >= y1 && t.cy <= y2) {
+          rotateTile(t);
+          any = true;
+        }
+      }
+      if (drag.rectEl) drag.rectEl.remove();
+      if (any) colorize();
+    } else if (drag.startTile) {
+      rotateTile(drag.startTile);
+      colorize();
+    }
+    drag = null;
+  }
+  svg.addEventListener("pointerup", endDrag);
+  svg.addEventListener("pointercancel", () => {
+    if (drag && drag.rectEl) drag.rectEl.remove();
+    drag = null;
+  });
+
+  // Suppress default touch behaviors that would interrupt drag (page pan/pinch)
+  svg.addEventListener("touchstart", (e) => e.preventDefault(), { passive: false });
+  svg.addEventListener("touchmove",  (e) => e.preventDefault(), { passive: false });
+})();
+</script>
+</body>
+</html>
