@@ -22,14 +22,14 @@
      own center. */
   @keyframes magic-node-breathe {
     0%, 100% { transform: scale(1); }
-    50%      { transform: scale(2); }
+    50%      { transform: scale(1.33); }
   }
   .color-nodes .node-dot {
     transform-box: fill-box;
     transform-origin: center;
   }
   body.searching .color-nodes .node-dot {
-    animation: magic-node-breathe 0.9s ease-in-out infinite;
+    animation: magic-node-breathe 1.8s ease-in-out infinite;
   }
   .tile-inner { transition: transform 450ms cubic-bezier(.22,.61,.36,1); transform-origin: 0 0; will-change: transform; }
   .tile { cursor: pointer; }
@@ -45,7 +45,7 @@
 <div id="mode-banner"></div>
 <script>
 (() => {
-  const APP_VERSION = "v6-mode5-noderadius-breathe-2026-05-25-1648";
+  const APP_VERSION = "v7-breathe-slower-33pct-2026-05-25-2110";
   console.log("hexwar app version:", APP_VERSION);
   const SVG_NS = "http://www.w3.org/2000/svg";
   const svg = document.getElementById("field");
