@@ -47,7 +47,7 @@
 <div id="mode-banner"></div>
 <script>
 (() => {
-  const APP_VERSION = "v9-radial-slide-2026-05-25-2120";
+  const APP_VERSION = "v10-radial-slide-desktop-2x-2026-05-25-2125";
   console.log("hexwar app version:", APP_VERSION);
   const SVG_NS = "http://www.w3.org/2000/svg";
   const svg = document.getElementById("field");
@@ -459,7 +459,12 @@
   // Screen point S = (panX + Z*worldX, panY + Z*worldY). The magic hex is always clamped
   // to remain visible.
   let worldG = null;
-  let Z = 1, panX = 0, panY = 0;
+  // Desktop web starts at 2x zoom (~half as many hexes per axis); touch
+  // devices keep the original 1x view. Wheel/pinch still adjust from here.
+  const IS_DESKTOP = (typeof window !== "undefined")
+    && window.matchMedia
+    && window.matchMedia("(pointer: fine)").matches;
+  let Z = IS_DESKTOP ? 2 : 1, panX = 0, panY = 0;
   const ZOOM_MIN = 0.35, ZOOM_MAX = 4.0;
 
   // World-space (svg viewBox) position of a pulse at its current `s`.
