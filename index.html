@@ -17,6 +17,20 @@
   svg#field { display: block; width: 100vw; height: 100vh; cursor: pointer; touch-action: none; user-select: none; -webkit-user-select: none; }
   .drag-rect { pointer-events: none; }
   /* (search runs in logical state; transitions stay on so improvements animate) */
+  /* Breathe the dot's radius via transform: scale (CSS `r` animation is patchy
+     across engines). transform-box: fill-box anchors the scale at the dot's
+     own center. */
+  @keyframes magic-node-breathe {
+    0%, 100% { transform: scale(1); }
+    50%      { transform: scale(2); }
+  }
+  .color-nodes .node-dot {
+    transform-box: fill-box;
+    transform-origin: center;
+  }
+  body.searching .color-nodes .node-dot {
+    animation: magic-node-breathe 0.9s ease-in-out infinite;
+  }
   .tile-inner { transition: transform 450ms cubic-bezier(.22,.61,.36,1); transform-origin: 0 0; will-change: transform; }
   .tile { cursor: pointer; }
   .tile:hover .hex-outline { stroke: rgba(58,54,46,0.42); }
@@ -31,6 +45,8 @@
 <div id="mode-banner"></div>
 <script>
 (() => {
+  const APP_VERSION = "v6-mode5-noderadius-breathe-2026-05-25-1648";
+  console.log("hexwar app version:", APP_VERSION);
   const SVG_NS = "http://www.w3.org/2000/svg";
   const svg = document.getElementById("field");
 
@@ -218,14 +234,15 @@
 
   // Count how many ribbon arcs are currently colored (not at BAND_FILL).
   function countColoredArcs() {
-    let n = 0;
-    for (const t of tiles.values()) {
-      if (t.isMagic) continue;
-      for (const k of ["A", "B", "C"]) {
-        if (t.arcs[k].getAttribute("fill") !== BAND_FILL) n++;
-      }
+    // Count unique (tile, arcName) covered by any strand. NOTE: do NOT read DOM
+    // fills — silentColorize=true during search skips fill writes, so the only
+    // reliable source of truth is `lastColorize.strands`.
+    if (!lastColorize) return 0;
+    const seen = new Set();
+    for (const s of lastColorize.strands) {
+      for (const a of s.arcs) seen.add(a.tile.col + "," + a.tile.row + "|" + a.arcName);
     }
-    return n;
+    return seen.size;
   }
 
   // Click on the magic tile triggers a 3-second random search for the rotation
@@ -236,23 +253,53 @@
   async function searchBestConfig(durationMs = 3000, modeIdx = currentMode) {
     if (searching) return;
     searching = true;
+    document.body.classList.add("searching"); // triggers magic-node breathe CSS
     const mode = MODES[modeIdx];
     const candidates = [];
     for (const t of tiles.values()) if (!t.isMagic) candidates.push(t);
     // Make sure lastColorize reflects current rotDeg before we score.
     colorize();
-    let bestScore = mode.score();
-    updateModeBanner(modeIdx, bestScore, "searching…");
-    const deadline = performance.now() + durationMs;
-    let iters = 0, improvements = 0;
+    let currentScore = mode.score();
 
-    // David, 2026-05-25: "all orientation changes are done by visible animated
-    // rotation." We achieve this by running trial mutations in LOGICAL state only
-    // (no DOM writes), scoring silently, and on improvements committing the new
-    // orientation to the DOM where the CSS transition does the animation.
+    // Random-restart hill climb with periodic big perturbation to escape local
+    // minima (David, 2026-05-25). everBest tracks the best score seen across all
+    // perturbation basins and we snapshot the rotation of every candidate tile at
+    // each new everBest so we can restore the global optimum at the end.
+    let everBest = currentScore;
+    const everBestRot = new Map();
+    for (const t of candidates) everBestRot.set(t, t.rotDeg);
+
+    updateModeBanner(modeIdx, currentScore, "searching…");
+    const deadline = performance.now() + durationMs;
+    let iters = 0, improvements = 0, perturbations = 0, sinceLast = 0;
+    const STAGNATION = 180;            // trials without improvement → perturb
+    const PERTURB_MIN = 6, PERTURB_MAX = 14;
+
     silentColorize = true;
     try {
       while (performance.now() < deadline) {
+        // ----- BIG PERTURBATION (always accepted) -----
+        if (sinceLast >= STAGNATION) {
+          const k = PERTURB_MIN + Math.floor(Math.random() * (PERTURB_MAX - PERTURB_MIN + 1));
+          // Commit perturbation visually so DOM stays in sync with logical state.
+          silentColorize = false;
+          for (let i = 0; i < k; i++) {
+            const t = candidates[Math.floor(Math.random() * candidates.length)];
+            const steps = 1 + Math.floor(Math.random() * 5);
+            t.rotDeg = t.rotDeg + steps * 60;
+            t.inner.style.transform = `rotate(${t.rotDeg}deg)`;
+            rotationByCell.set(t.col + "," + t.row, ((t.rotDeg % 360) + 360) % 360);
+          }
+          colorize();
+          silentColorize = true;
+          currentScore = mode.score();
+          perturbations++;
+          sinceLast = 0;
+          iters++;
+          if (iters % 5 === 0) await new Promise(r => setTimeout(r, 0));
+          continue;
+        }
+        // ----- NORMAL TRIAL -----
         const k = 1 + Math.floor(Math.random() * 3);
         const changes = [];
         for (let i = 0; i < k; i++) {
@@ -264,9 +311,9 @@
         }
         colorize(); // silent: only computes lastColorize
         const s = mode.score();
-        if (s > bestScore) {
-          bestScore = s;
-          improvements++;
+        if (s > currentScore) {
+          currentScore = s;
+          sinceLast = 0;
           // Commit visually: animated transform + apply colors for this state.
           silentColorize = false;
           for (const [t] of changes) {
@@ -275,13 +322,19 @@
           }
           colorize();
           silentColorize = true;
-          updateModeBanner(modeIdx, bestScore, "searching…");
+          if (s > everBest) {
+            everBest = s;
+            improvements++;
+            for (const t of candidates) everBestRot.set(t, t.rotDeg);
+            updateModeBanner(modeIdx, everBest, "searching…");
+          }
         } else {
-          // Revert logical state only — DOM was never touched.
+          // Revert logical state only — DOM was never touched on this trial.
           for (let i = changes.length - 1; i >= 0; i--) {
             const [t, prev] = changes[i];
             t.rotDeg = prev;
           }
+          sinceLast++;
         }
         iters++;
         if (iters % 5 === 0) await new Promise(r => setTimeout(r, 0));
@@ -289,11 +342,24 @@
     } finally {
       silentColorize = false;
     }
-    // Ensure the visible state matches the final logical state.
+
+    // Restore everBest configuration if we're not already there (animated).
+    let restored = 0;
+    for (const t of candidates) {
+      const target = everBestRot.get(t);
+      if (t.rotDeg !== target) {
+        t.rotDeg = target;
+        t.inner.style.transform = `rotate(${target}deg)`;
+        rotationByCell.set(t.col + "," + t.row, ((target % 360) + 360) % 360);
+        restored++;
+      }
+    }
     colorize();
+
+    document.body.classList.remove("searching");
     searching = false;
-    updateModeBanner(modeIdx, bestScore, `${iters} trials, +${improvements}`);
-    console.log(`search mode=${modeIdx} (${mode.name}): iters=${iters} improvements=${improvements} score=${bestScore}`);
+    updateModeBanner(modeIdx, everBest, `${iters} trials, +${improvements}`);
+    console.log(`search mode=${modeIdx} (${mode.name}): iters=${iters} improvements=${improvements} perturbations=${perturbations} restored=${restored} score=${everBest}`);
   }
 
   // ---------- Pulses ----------
@@ -600,6 +666,7 @@
       dot.setAttribute("stroke", BAND_EDGE);
       dot.setAttribute("stroke-width", "1.2");
       dot.setAttribute("class", "node-dot");
+      dot.style.setProperty("--dot-r", dotR);
       dotsG.appendChild(dot);
       dots.push(dot);
     }
@@ -700,6 +767,7 @@
     { name: "Most closed loops",                  score: () => scoreClosedLoops() },
     { name: "Most multi-color intersections",     score: () => scoreMulticolorIntersections() },
     { name: "Longest magic-to-magic path",        score: () => scoreLongestMagicReturn() },
+    { name: "Longest shortest-color line",        score: () => scoreLongestShortestColor() },
   ];
   let currentMode = 0; // index into MODES
 
@@ -718,6 +786,19 @@
     return best;
   }
 
+  function scoreLongestShortestColor() {
+    // Max-min: maximize the length (in arcs) of the SHORTEST-colored strand.
+    // David's spec: if not all 6 ROYGBV colors are present, score is 0. A color
+    // is "present" iff there's a strand of that color emitted from magic.
+    if (!lastColorize) return 0;
+    if (lastColorize.strands.length < 6) return 0;
+    let minLen = Infinity;
+    for (const s of lastColorize.strands) {
+      if (s.arcs.length < minLen) minLen = s.arcs.length;
+    }
+    return minLen === Infinity ? 0 : minLen;
+  }
+
   function scoreLongestMagicReturn() {
     if (!lastColorize) return 0;
     let best = 0;
@@ -730,12 +811,21 @@
   function scoreMulticolorIntersections() {
     // A non-magic tile is a Celtic crossing of arcs B and C; count tiles where
     // both arcs are colored AND with different colors (= two strands crossing).
+    // Use `lastColorize.strands` (not DOM fills) — see countColoredArcs note.
+    if (!lastColorize) return 0;
+    const byTile = new Map(); // "c,r" -> { B: color, C: color }
+    for (const s of lastColorize.strands) {
+      for (const a of s.arcs) {
+        if (a.arcName !== "B" && a.arcName !== "C") continue;
+        const k = a.tile.col + "," + a.tile.row;
+        let e = byTile.get(k);
+        if (!e) { e = {}; byTile.set(k, e); }
+        e[a.arcName] = s.color;
+      }
+    }
     let n = 0;
-    for (const t of tiles.values()) {
-      if (t.isMagic) continue;
-      const fb = t.arcs.B.getAttribute("fill");
-      const fc = t.arcs.C.getAttribute("fill");
-      if (fb !== BAND_FILL && fc !== BAND_FILL && fb !== fc) n++;
+    for (const e of byTile.values()) {
+      if (e.B && e.C && e.B !== e.C) n++;
     }
     return n;
   }
@@ -1082,8 +1172,11 @@
     } else if (drag.startTile) {
       if (drag.startTile.isMagic) {
         // Advance to next optimization mode, then run a 3s search under it.
-        currentMode = (currentMode + 1) % MODES.length;
-        searchBestConfig(3000, currentMode);
+        // While a search is in flight, ignore taps on magic entirely.
+        if (!searching) {
+          currentMode = (currentMode + 1) % MODES.length;
+          searchBestConfig(3000, currentMode);
+        }
       } else {
         rotateTile(drag.startTile);
         colorize();
