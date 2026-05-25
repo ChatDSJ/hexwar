@@ -390,6 +390,8 @@
     const circle = document.createElementNS(SVG_NS, "circle");
     circle.setAttribute("r", PULSE_RADIUS.toFixed(2));
     circle.setAttribute("fill", color);
+    circle.setAttribute("stroke", BAND_EDGE);
+    circle.setAttribute("stroke-width", "1.2");
     pulseLayer.appendChild(circle);
     pulses.push({
       startTime: performance.now(),
