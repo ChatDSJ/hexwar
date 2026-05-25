@@ -351,52 +351,44 @@
     }
   }
 
-  // Build the segment list for a pulse emerging from magic-tile side `startSide`.
-  // Same trace algorithm as colorize(); each segment records the tile + which local
-  // arc + entry/exit local side numbers so we can position the pulse precisely.
-  function buildPulseSegments(startSide) {
-    if (!magicKey) return null;
-    const m = tiles.get(magicKey);
-    if (!m) return null;
-    const segments = [];
-    let exitSide = startSide;
-    let c = m.col, r = m.row;
-    const visited = new Set();
-    let steps = 0;
-    while (steps++ < 50000) {
-      const [nc, nr] = neighborOf(c, r, exitSide);
-      const enterSide = (exitSide + 3) % 6;
-      if (nc === m.col && nr === m.row) return segments; // back to magic
-      const nKey = nc + "," + nr;
-      const nt = tiles.get(nKey);
-      if (!nt) return segments; // off-grid
-      const visitKey = nKey + "|" + enterSide;
-      if (visited.has(visitKey)) return segments;
-      visited.add(visitKey);
-      const arcName = arcAtSide(nt.rotDeg, enterSide);
-      const u = rotUnit(nt.rotDeg);
-      const lEnter = ((enterSide - u) % 6 + 6) % 6;
-      const exitWorld = partnerSide(nt.rotDeg, enterSide);
-      const lExit = ((exitWorld - u) % 6 + 6) % 6;
-      segments.push({ tile: nt, arcName, lEnter, lExit, length: ARC_GEOM[arcName].length });
-      c = nc; r = nr; exitSide = exitWorld;
-    }
-    return segments;
-  }
-
+  // Pulses are MEMORYLESS (David, 2026-05-25): the only state a pulse carries is
+  // its color, the mini-segment it is currently on (tile + arcName + which side
+  // it entered through → which side it will exit through), and its arclength s
+  // along that segment. When s passes the segment length, the pulse looks up the
+  // next segment from the CURRENT grid configuration — so user rotations made
+  // while the pulse is in flight re-route subsequent steps immediately.
   const pulses = [];
   let pulseEmitCounter = 0;
   let pulseRAF = null;
+  const PULSE_MAX_AGE_MS = 60000; // safety cap for non-terminating loops
+
+  // Build a fresh segment state object for a pulse just entering `tile` from
+  // world side `worldEnter`. Returns null if the entry isn't a real ribbon arc
+  // (shouldn't happen, but guards against corruption).
+  function segmentStateFor(tile, worldEnter) {
+    const arcName = arcAtSide(tile.rotDeg, worldEnter);
+    if (!arcName) return null;
+    const u = rotUnit(tile.rotDeg);
+    const lEnter = ((worldEnter - u) % 6 + 6) % 6;
+    const worldExit = partnerSide(tile.rotDeg, worldEnter);
+    const lExit = ((worldExit - u) % 6 + 6) % 6;
+    return {
+      tile, arcName, lEnter, lExit, worldExit,
+      segLen: ARC_GEOM[arcName].length,
+    };
+  }
 
   function emitPulse(startSide) {
-    const segments = buildPulseSegments(startSide);
-    if (!segments || segments.length === 0) return;
-    let total = 0;
-    for (const s of segments) total += s.length;
-    // Color: sample the first arc's current colored fill; fall back to ROYGBV index.
-    const firstSeg = segments[0];
-    const firstArc = firstSeg.tile.arcs[firstSeg.arcName];
-    let color = firstArc.getAttribute("fill");
+    const m = magicKey ? tiles.get(magicKey) : null;
+    if (!m) return;
+    const [nc, nr] = neighborOf(m.col, m.row, startSide);
+    const nt = tiles.get(nc + "," + nr);
+    if (!nt || nt === m) return; // off-grid or oddly back to magic
+    const worldEnter = (startSide + 3) % 6;
+    const seg = segmentStateFor(nt, worldEnter);
+    if (!seg) return;
+
+    let color = nt.arcs[seg.arcName].getAttribute("fill");
     if (!color || color === BAND_FILL) color = COLORS[startSide % COLORS.length];
     const circle = document.createElementNS(SVG_NS, "circle");
     circle.setAttribute("r", PULSE_RADIUS.toFixed(2));
@@ -404,11 +396,12 @@
     circle.setAttribute("stroke", BAND_EDGE);
     circle.setAttribute("stroke-width", "1.2");
     circle.style.pointerEvents = "none";
-    placePulseInTile(circle, firstSeg.tile, firstSeg.arcName);
+    placePulseInTile(circle, seg.tile, seg.arcName);
+
+    const now = performance.now();
     pulses.push({
-      startTime: performance.now(),
-      segments, totalLength: total, color, circle,
-      curIdx: 0, // index of the segment currently parenting the circle
+      color, circle, s: 0, lastT: now, bornAt: now,
+      ...seg,
     });
     if (pulseRAF === null) pulseRAF = requestAnimationFrame(stepPulses);
   }
@@ -417,31 +410,40 @@
     pulseRAF = null;
     if (pulses.length === 0) return;
     const now = performance.now();
+    const m = magicKey ? tiles.get(magicKey) : null;
     for (let i = pulses.length - 1; i >= 0; i--) {
       const p = pulses[i];
-      const traveled = ((now - p.startTime) / 1000) * PULSE_SPEED;
-      if (traveled >= p.totalLength) {
-        p.circle.remove();
-        pulses.splice(i, 1);
-        continue;
+      if (now - p.bornAt > PULSE_MAX_AGE_MS) {
+        p.circle.remove(); pulses.splice(i, 1); continue;
       }
-      let s = traveled, idx = 0;
-      while (idx < p.segments.length && s > p.segments[idx].length) {
-        s -= p.segments[idx].length;
-        idx++;
+      const dt = (now - p.lastT) / 1000;
+      p.lastT = now;
+      p.s += dt * PULSE_SPEED;
+
+      let dead = false;
+      while (p.s >= p.segLen) {
+        const overshoot = p.s - p.segLen;
+        // Step into the next tile via the current segment's worldExit.
+        const [nc, nr] = neighborOf(p.tile.col, p.tile.row, p.worldExit);
+        if (m && nc === m.col && nr === m.row) { dead = true; break; }
+        const nt = tiles.get(nc + "," + nr);
+        if (!nt) { dead = true; break; }
+        const worldEnter = (p.worldExit + 3) % 6;
+        const nextSeg = segmentStateFor(nt, worldEnter);
+        if (!nextSeg) { dead = true; break; }
+        // Apply the transition.
+        p.tile = nextSeg.tile;
+        p.arcName = nextSeg.arcName;
+        p.lEnter = nextSeg.lEnter;
+        p.lExit = nextSeg.lExit;
+        p.worldExit = nextSeg.worldExit;
+        p.segLen = nextSeg.segLen;
+        p.s = overshoot;
+        placePulseInTile(p.circle, p.tile, p.arcName);
       }
-      if (idx >= p.segments.length) {
-        p.circle.remove();
-        pulses.splice(i, 1);
-        continue;
-      }
-      // Reparent into the new tile/arc if we've moved on.
-      if (idx !== p.curIdx) {
-        const seg = p.segments[idx];
-        placePulseInTile(p.circle, seg.tile, seg.arcName);
-        p.curIdx = idx;
-      }
-      const [lx, ly] = pulseLocalPoint(p.segments[idx], s);
+      if (dead) { p.circle.remove(); pulses.splice(i, 1); continue; }
+
+      const [lx, ly] = pulseLocalPoint({ arcName: p.arcName, lEnter: p.lEnter }, p.s);
       p.circle.setAttribute("cx", lx.toFixed(2));
       p.circle.setAttribute("cy", ly.toFixed(2));
     }
