@@ -16,7 +16,7 @@
   body { font-family: system-ui, sans-serif; -webkit-tap-highlight-color: transparent; }
   svg#field { display: block; width: 100vw; height: 100vh; cursor: pointer; touch-action: none; user-select: none; -webkit-user-select: none; }
   .drag-rect { pointer-events: none; }
-  body.searching .tile-inner { transition: none !important; }
+  /* (search runs in logical state; transitions stay on so improvements animate) */
   .tile-inner { transition: transform 450ms cubic-bezier(.22,.61,.36,1); transform-origin: 0 0; will-change: transform; }
   .tile { cursor: pointer; }
   .tile:hover .hex-outline { stroke: rgba(58,54,46,0.42); }
@@ -236,46 +236,61 @@
   async function searchBestConfig(durationMs = 3000, modeIdx = currentMode) {
     if (searching) return;
     searching = true;
-    document.body.classList.add("searching");
     const mode = MODES[modeIdx];
     const candidates = [];
     for (const t of tiles.values()) if (!t.isMagic) candidates.push(t);
+    // Make sure lastColorize reflects current rotDeg before we score.
+    colorize();
     let bestScore = mode.score();
     updateModeBanner(modeIdx, bestScore, "searching…");
     const deadline = performance.now() + durationMs;
     let iters = 0, improvements = 0;
-    while (performance.now() < deadline) {
-      const k = 1 + Math.floor(Math.random() * 3);
-      const changes = [];
-      for (let i = 0; i < k; i++) {
-        const t = candidates[Math.floor(Math.random() * candidates.length)];
-        const prev = t.rotDeg;
-        const steps = 1 + Math.floor(Math.random() * 5);
-        t.rotDeg = prev + steps * 60;
-        t.inner.style.transform = `rotate(${t.rotDeg}deg)`;
-        changes.push([t, prev]);
-      }
-      colorize();
-      const s = mode.score();
-      if (s > bestScore) {
-        bestScore = s;
-        improvements++;
-        for (const [t] of changes) {
-          rotationByCell.set(t.col + "," + t.row, ((t.rotDeg % 360) + 360) % 360);
+
+    // David, 2026-05-25: "all orientation changes are done by visible animated
+    // rotation." We achieve this by running trial mutations in LOGICAL state only
+    // (no DOM writes), scoring silently, and on improvements committing the new
+    // orientation to the DOM where the CSS transition does the animation.
+    silentColorize = true;
+    try {
+      while (performance.now() < deadline) {
+        const k = 1 + Math.floor(Math.random() * 3);
+        const changes = [];
+        for (let i = 0; i < k; i++) {
+          const t = candidates[Math.floor(Math.random() * candidates.length)];
+          const prev = t.rotDeg;
+          const steps = 1 + Math.floor(Math.random() * 5);
+          t.rotDeg = prev + steps * 60;
+          changes.push([t, prev]);
         }
-        updateModeBanner(modeIdx, bestScore, "searching…");
-      } else {
-        for (let i = changes.length - 1; i >= 0; i--) {
-          const [t, prev] = changes[i];
-          t.rotDeg = prev;
-          t.inner.style.transform = `rotate(${t.rotDeg}deg)`;
+        colorize(); // silent: only computes lastColorize
+        const s = mode.score();
+        if (s > bestScore) {
+          bestScore = s;
+          improvements++;
+          // Commit visually: animated transform + apply colors for this state.
+          silentColorize = false;
+          for (const [t] of changes) {
+            t.inner.style.transform = `rotate(${t.rotDeg}deg)`;
+            rotationByCell.set(t.col + "," + t.row, ((t.rotDeg % 360) + 360) % 360);
+          }
+          colorize();
+          silentColorize = true;
+          updateModeBanner(modeIdx, bestScore, "searching…");
+        } else {
+          // Revert logical state only — DOM was never touched.
+          for (let i = changes.length - 1; i >= 0; i--) {
+            const [t, prev] = changes[i];
+            t.rotDeg = prev;
+          }
         }
-        colorize();
+        iters++;
+        if (iters % 5 === 0) await new Promise(r => setTimeout(r, 0));
       }
-      iters++;
-      if (iters % 5 === 0) await new Promise(r => setTimeout(r, 0));
+    } finally {
+      silentColorize = false;
     }
-    document.body.classList.remove("searching");
+    // Ensure the visible state matches the final logical state.
+    colorize();
     searching = false;
     updateModeBanner(modeIdx, bestScore, `${iters} trials, +${improvements}`);
     console.log(`search mode=${modeIdx} (${mode.name}): iters=${iters} improvements=${improvements} score=${bestScore}`);
@@ -602,16 +617,22 @@
   // Most-recent colorize() output, used by the various optimization-mode scoring
   // functions. `strands` is one entry per unique colored emanation from magic.
   let lastColorize = null;
+  // While true, colorize() skips all DOM mutations (fills + magic node dots).
+  // The strand structure in `lastColorize` is still computed, which is all the
+  // optimization scoring functions need.
+  let silentColorize = false;
 
   function colorize() {
     if (!magicKey) { lastColorize = null; return; }
     const magicTile = tiles.get(magicKey);
     if (!magicTile) return;
 
-    // Reset all ribbon fills to default (skip the magic tile — it has no ribbons)
-    for (const t of tiles.values()) {
-      if (t.isMagic) continue;
-      for (const k of ["A", "B", "C"]) t.arcs[k].setAttribute("fill", BAND_FILL);
+    if (!silentColorize) {
+      // Reset all ribbon fills to default (skip the magic tile — it has no ribbons)
+      for (const t of tiles.values()) {
+        if (t.isMagic) continue;
+        for (const k of ["A", "B", "C"]) t.arcs[k].setAttribute("fill", BAND_FILL);
+      }
     }
     const nodeColors = [null, null, null, null, null, null];
     const strands = [];
@@ -652,7 +673,7 @@
         visited.add(visitKey);
 
         const arcName = arcAtSide(nt.rotDeg, enterSide);
-        nt.arcs[arcName].setAttribute("fill", color);
+        if (!silentColorize) nt.arcs[arcName].setAttribute("fill", color);
         arcs.push({ tile: nt, arcName });
         const nextExit = partnerSide(nt.rotDeg, enterSide);
         c = nc; r = nr; exitSide = nextExit;
@@ -660,9 +681,11 @@
       strands.push({ color, startSide, endSide, returnedToMagic, arcs });
     }
 
-    for (let s = 0; s < 6; s++) {
-      const dot = magicTile.colorNodes[s];
-      dot.setAttribute("fill", nodeColors[s] || "#ffffff");
+    if (!silentColorize) {
+      for (let s = 0; s < 6; s++) {
+        const dot = magicTile.colorNodes[s];
+        dot.setAttribute("fill", nodeColors[s] || "#ffffff");
+      }
     }
     lastColorize = { strands, nodeColors };
   }
