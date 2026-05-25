@@ -23,10 +23,22 @@
   .hex-outline { transition: stroke 200ms ease; }
   .ribbon { transition: fill 420ms ease; }
   .node-dot { transition: fill 420ms ease; }
+  #mode-banner {
+    position: fixed; left: 14px; bottom: 12px;
+    font: 13px/1.35 system-ui, sans-serif;
+    color: var(--band-edge); opacity: 0.78;
+    background: rgba(236,230,214,0.7);
+    padding: 6px 10px; border-radius: 6px;
+    pointer-events: none; user-select: none;
+    backdrop-filter: blur(2px);
+  }
+  #mode-banner b { font-weight: 600; }
+  #mode-banner .meta { opacity: 0.65; font-size: 11px; margin-left: 6px; }
 </style>
 </head>
 <body>
 <svg id="field" xmlns="http://www.w3.org/2000/svg"></svg>
+<div id="mode-banner"></div>
 <script>
 (() => {
   const SVG_NS = "http://www.w3.org/2000/svg";
@@ -231,17 +243,18 @@
   // is mutated in-place — accepted improvements stay, rejected trials revert —
   // so the screen always shows the current best-so-far.
   let searching = false;
-  async function searchBestConfig(durationMs = 3000) {
+  async function searchBestConfig(durationMs = 3000, modeIdx = currentMode) {
     if (searching) return;
     searching = true;
     document.body.classList.add("searching");
+    const mode = MODES[modeIdx];
     const candidates = [];
     for (const t of tiles.values()) if (!t.isMagic) candidates.push(t);
-    let bestScore = countColoredArcs();
+    let bestScore = mode.score();
+    updateModeBanner(modeIdx, bestScore, "searching…");
     const deadline = performance.now() + durationMs;
     let iters = 0, improvements = 0;
     while (performance.now() < deadline) {
-      // Perturb 1..3 random tiles by a random multiple of 60°.
       const k = 1 + Math.floor(Math.random() * 3);
       const changes = [];
       for (let i = 0; i < k; i++) {
@@ -253,15 +266,15 @@
         changes.push([t, prev]);
       }
       colorize();
-      const s = countColoredArcs();
+      const s = mode.score();
       if (s > bestScore) {
         bestScore = s;
         improvements++;
         for (const [t] of changes) {
           rotationByCell.set(t.col + "," + t.row, ((t.rotDeg % 360) + 360) % 360);
         }
+        updateModeBanner(modeIdx, bestScore, "searching…");
       } else {
-        // Revert in reverse order to handle the case of the same tile twice.
         for (let i = changes.length - 1; i >= 0; i--) {
           const [t, prev] = changes[i];
           t.rotDeg = prev;
@@ -270,14 +283,12 @@
         colorize();
       }
       iters++;
-      // Yield to the browser so paint can flush and the user sees the best-so-far.
-      if (iters % 5 === 0) {
-        await new Promise(r => setTimeout(r, 0));
-      }
+      if (iters % 5 === 0) await new Promise(r => setTimeout(r, 0));
     }
     document.body.classList.remove("searching");
     searching = false;
-    console.log(`search: iters=${iters} improvements=${improvements} score=${bestScore}`);
+    updateModeBanner(modeIdx, bestScore, `${iters} trials, +${improvements}`);
+    console.log(`search mode=${modeIdx} (${mode.name}): iters=${iters} improvements=${improvements} score=${bestScore}`);
   }
 
   // ---------- Pulses ----------
@@ -361,6 +372,7 @@
   let pulseEmitCounter = 0;
   let pulseRAF = null;
   let mstLayer = null;
+  let SHOW_MST = false; // hidden by default (David, 2026-05-25); MST code still active
 
   // World-space (svg viewBox) position of a pulse at its current `s`.
   function pulseWorld(p) {
@@ -511,7 +523,8 @@
       p.circle.setAttribute("cx", lx.toFixed(2));
       p.circle.setAttribute("cy", ly.toFixed(2));
     }
-    drawMST();
+    if (SHOW_MST) drawMST();
+    else if (mstLayer && mstLayer.firstChild) while (mstLayer.firstChild) mstLayer.removeChild(mstLayer.firstChild);
     if (pulses.length > 0) pulseRAF = requestAnimationFrame(stepPulses);
     else if (mstLayer) while (mstLayer.firstChild) mstLayer.removeChild(mstLayer.firstChild);
   }
@@ -587,8 +600,12 @@
   //   Color every ribbon arc along the way. When the trace returns to the magic
   //   tile at some side Nk, also color the magic-tile arc reaching Nk and that
   //   node, then stop. If the trace runs off-grid, stop. Repeat.
+  // Most-recent colorize() output, used by the various optimization-mode scoring
+  // functions. `strands` is one entry per unique colored emanation from magic.
+  let lastColorize = null;
+
   function colorize() {
-    if (!magicKey) return;
+    if (!magicKey) { lastColorize = null; return; }
     const magicTile = tiles.get(magicKey);
     if (!magicTile) return;
 
@@ -598,6 +615,7 @@
       for (const k of ["A", "B", "C"]) t.arcs[k].setAttribute("fill", BAND_FILL);
     }
     const nodeColors = [null, null, null, null, null, null];
+    const strands = [];
     let nextColor = 0;
 
     for (let startSide = 0; startSide < 6; startSide++) {
@@ -606,14 +624,12 @@
       const color = COLORS[nextColor++];
       nodeColors[startSide] = color;
 
-      // Exit the magic tile through `startSide`.  We do NOT color the magic tile's
-      // internal arc connected to startSide (interpretation (a) keeps the magic
-      // interior neutral); we only walk outward.
       let exitSide = startSide;
       let c = magicTile.col, r = magicTile.row;
       const visited = new Set();
-      // Cap on trace length to avoid pathologies (huge grids should still terminate
-      // by either return-to-magic, off-grid, or loop, but this is a safety belt).
+      const arcs = [];
+      let returnedToMagic = false;
+      let endSide = null;
       let steps = 0;
       const STEP_CAP = 50000;
 
@@ -621,35 +637,151 @@
         const [nc, nr] = neighborOf(c, r, exitSide);
         const enterSide = (exitSide + 3) % 6;
 
-        // Did we re-enter the magic tile?
         if (nc === magicTile.col && nr === magicTile.row) {
-          // Magic tile has no internal ribbons — just color the destination node.
           if (nodeColors[enterSide] === null) nodeColors[enterSide] = color;
+          returnedToMagic = true;
+          endSide = enterSide;
           break;
         }
 
         const nKey = nc + "," + nr;
         const nt = tiles.get(nKey);
-        if (!nt) break; // ran off the grid
+        if (!nt) break;
 
-        // Loop detection: (tile, enterSide) seen before -> stop
         const visitKey = nKey + "|" + enterSide;
         if (visited.has(visitKey)) break;
         visited.add(visitKey);
 
-        // Color this arc and continue.
         const arcName = arcAtSide(nt.rotDeg, enterSide);
         nt.arcs[arcName].setAttribute("fill", color);
+        arcs.push({ tile: nt, arcName });
         const nextExit = partnerSide(nt.rotDeg, enterSide);
         c = nc; r = nr; exitSide = nextExit;
       }
+      strands.push({ color, startSide, endSide, returnedToMagic, arcs });
     }
 
-    // Apply color-node dot fills
     for (let s = 0; s < 6; s++) {
       const dot = magicTile.colorNodes[s];
       dot.setAttribute("fill", nodeColors[s] || "#ffffff");
     }
+    lastColorize = { strands, nodeColors };
+  }
+
+  // ---------- Optimization modes ----------
+  // David, 2026-05-25: clicking the magic tile cycles through these modes; each
+  // click runs searchBestConfig() with that mode's objective function. Mode 1 is
+  // the original total-colored-arc-count optimizer.
+  const MODES = [
+    { name: "Total colored arcs",                 score: () => countColoredArcs() },
+    { name: "Longest colored path",               score: () => scoreLongestColoredPath() },
+    { name: "Most closed loops",                  score: () => scoreClosedLoops() },
+    { name: "Most multi-color intersections",     score: () => scoreMulticolorIntersections() },
+    { name: "Longest magic-to-magic path",        score: () => scoreLongestMagicReturn() },
+  ];
+  let currentMode = 0; // index into MODES
+
+  const modeBanner = document.getElementById("mode-banner");
+  function updateModeBanner(idx, score, meta) {
+    if (!modeBanner) return;
+    const m = MODES[idx];
+    const metaStr = meta ? `<span class="meta">${meta}</span>` : "";
+    modeBanner.innerHTML = `<b>Mode ${idx + 1}/${MODES.length}:</b> ${m.name} \u2014 score ${score}${metaStr}`;
+  }
+
+  function scoreLongestColoredPath() {
+    if (!lastColorize) return 0;
+    let best = 0;
+    for (const s of lastColorize.strands) if (s.arcs.length > best) best = s.arcs.length;
+    return best;
+  }
+
+  function scoreLongestMagicReturn() {
+    if (!lastColorize) return 0;
+    let best = 0;
+    for (const s of lastColorize.strands) {
+      if (s.returnedToMagic && s.arcs.length > best) best = s.arcs.length;
+    }
+    return best;
+  }
+
+  function scoreMulticolorIntersections() {
+    // A non-magic tile is a Celtic crossing of arcs B and C; count tiles where
+    // both arcs are colored AND with different colors (= two strands crossing).
+    let n = 0;
+    for (const t of tiles.values()) {
+      if (t.isMagic) continue;
+      const fb = t.arcs.B.getAttribute("fill");
+      const fc = t.arcs.C.getAttribute("fill");
+      if (fb !== BAND_FILL && fc !== BAND_FILL && fb !== fc) n++;
+    }
+    return n;
+  }
+
+  function scoreClosedLoops() {
+    // Count closed (cyclic) strands anywhere in the visible grid that do NOT
+    // touch the magic tile. Strands touching magic are colored emanations and
+    // are by definition open at the magic end.
+    const m = magicKey ? tiles.get(magicKey) : null;
+    const seen = new Set();
+    // Pre-mark magic-touching arcs so we don't re-walk them.
+    if (lastColorize) {
+      for (const strand of lastColorize.strands) {
+        for (const a of strand.arcs) seen.add(a.tile.col + "," + a.tile.row + "|" + a.arcName);
+      }
+    }
+    const BASE_SIDES = { A: [0, 1], B: [2, 4], C: [3, 5] };
+    let loops = 0;
+    for (const [key, t] of tiles) {
+      if (t.isMagic) continue;
+      for (const arcName of ["A", "B", "C"]) {
+        const k = key + "|" + arcName;
+        if (seen.has(k)) continue;
+        seen.add(k);
+        const u = rotUnit(t.rotDeg);
+        const [la, lb] = BASE_SIDES[arcName];
+        const wa = ((la + u) % 6 + 6) % 6;
+        const wb = ((lb + u) % 6 + 6) % 6;
+        // Walk forward via wa. If we close back to k, it's a closed loop.
+        let closed = false;
+        {
+          let c = t.col, r = t.row, exitWorld = wa, safety = 0;
+          while (safety++ < 50000) {
+            const [nc, nr] = neighborOf(c, r, exitWorld);
+            if (m && nc === m.col && nr === m.row) break;
+            const nt = tiles.get(nc + "," + nr);
+            if (!nt) break;
+            const enterWorld = (exitWorld + 3) % 6;
+            const an = arcAtSide(nt.rotDeg, enterWorld);
+            const kk = nc + "," + nr + "|" + an;
+            if (kk === k) { closed = true; break; }
+            if (seen.has(kk)) break;
+            seen.add(kk);
+            exitWorld = partnerSide(nt.rotDeg, enterWorld);
+            c = nc; r = nr;
+          }
+        }
+        // If not closed, also drain the other direction so seen covers the whole strand.
+        if (!closed) {
+          let c = t.col, r = t.row, exitWorld = wb, safety = 0;
+          while (safety++ < 50000) {
+            const [nc, nr] = neighborOf(c, r, exitWorld);
+            if (m && nc === m.col && nr === m.row) break;
+            const nt = tiles.get(nc + "," + nr);
+            if (!nt) break;
+            const enterWorld = (exitWorld + 3) % 6;
+            const an = arcAtSide(nt.rotDeg, enterWorld);
+            const kk = nc + "," + nr + "|" + an;
+            if (seen.has(kk)) break;
+            seen.add(kk);
+            exitWorld = partnerSide(nt.rotDeg, enterWorld);
+            c = nc; r = nr;
+          }
+        }
+        if (closed) loops++;
+      }
+    }
+    return loops;
   }
 
   // ---------- Layout ----------
@@ -731,6 +863,7 @@
 
   build();
   startPulseEmitter();
+  updateModeBanner(currentMode, MODES[currentMode].score(), "tap magic tile to cycle");
 
   let resizeTimer = null;
   window.addEventListener("resize", () => {
@@ -814,7 +947,9 @@
       if (any) colorize();
     } else if (drag.startTile) {
       if (drag.startTile.isMagic) {
-        searchBestConfig();
+        // Advance to next optimization mode, then run a 3s search under it.
+        currentMode = (currentMode + 1) % MODES.length;
+        searchBestConfig(3000, currentMode);
       } else {
         rotateTile(drag.startTile);
         colorize();
