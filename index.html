@@ -279,6 +279,171 @@
     console.log(`search: iters=${iters} improvements=${improvements} score=${bestScore}`);
   }
 
+  // ---------- Pulses ----------
+  // Once per second, the magic tile emits a pulse out of one of its sides (cycling
+  // 0..5..0..5..). The pulse travels along the strand at one hex-width per second
+  // and is a solid circle 25% wider than the ribbon, colored to match the strand
+  // it is on. Pulses live until they re-enter the magic tile or run off the grid.
+
+  const HEX_WIDTH = 2 * R;             // flat-top hex vertex-to-vertex distance
+  const PULSE_SPEED = HEX_WIDTH;       // pixels per second
+  const PULSE_RADIUS = 0.625 * RIBBON; // diameter = 1.25 * ribbon width
+  const PULSE_PERIOD_MS = 1000;        // one pulse per second
+
+  // For each local arc, precompute which endpoint (a1 or a2) is at which local
+  // side. The arc geometry is the same for every tile; only tile transforms differ.
+  function endpointMap(arc, lSides) {
+    const out = {};
+    for (const lSide of lSides) {
+      const m = MID[lSide];
+      const dx = m[0] - arc.center[0], dy = m[1] - arc.center[1];
+      const ang = Math.atan2(dy, dx);
+      const wrap = (v) => { while (v > Math.PI) v -= 2 * Math.PI; while (v < -Math.PI) v += 2 * Math.PI; return v; };
+      const da1 = Math.abs(wrap(ang - arc.a1));
+      const da2 = Math.abs(wrap(ang - arc.a2));
+      const key = da1 < da2 ? "a1" : "a2";
+      out[lSide] = key;
+    }
+    return out;
+  }
+  function arcSweep(arc) {
+    let a2 = arc.a2;
+    if (a2 < arc.a1) a2 += 2 * Math.PI;
+    return a2 - arc.a1; // positive
+  }
+  const ARC_GEOM = {
+    A: { arc: A, ends: endpointMap(A, [0, 1]), sweep: arcSweep(A), length: A.r * arcSweep(A) },
+    B: { arc: B, ends: endpointMap(B, [2, 4]), sweep: arcSweep(B), length: B.r * arcSweep(B) },
+    C: { arc: C, ends: endpointMap(C, [3, 5]), sweep: arcSweep(C), length: C.r * arcSweep(C) },
+  };
+
+  // Compute world (svg) position of a point on a pulse segment at arclength `s`.
+  function pulsePoint(seg, s) {
+    const g = ARC_GEOM[seg.arcName];
+    const startKey = g.ends[seg.lEnter];          // "a1" or "a2"
+    const startAng = startKey === "a1" ? g.arc.a1 : g.arc.a2;
+    const sign = startKey === "a1" ? +1 : -1;
+    const ang = startAng + sign * (s / g.arc.r);
+    const lx = g.arc.center[0] + g.arc.r * Math.cos(ang);
+    const ly = g.arc.center[1] + g.arc.r * Math.sin(ang);
+    const t = seg.tile;
+    const a = t.rotDeg * Math.PI / 180;
+    const ca = Math.cos(a), sa = Math.sin(a);
+    return [t.cx + ca * lx - sa * ly, t.cy + sa * lx + ca * ly];
+  }
+
+  // Build the segment list for a pulse emerging from magic-tile side `startSide`.
+  // Same trace algorithm as colorize(); each segment records the tile + which local
+  // arc + entry/exit local side numbers so we can position the pulse precisely.
+  function buildPulseSegments(startSide) {
+    if (!magicKey) return null;
+    const m = tiles.get(magicKey);
+    if (!m) return null;
+    const segments = [];
+    let exitSide = startSide;
+    let c = m.col, r = m.row;
+    const visited = new Set();
+    let steps = 0;
+    while (steps++ < 50000) {
+      const [nc, nr] = neighborOf(c, r, exitSide);
+      const enterSide = (exitSide + 3) % 6;
+      if (nc === m.col && nr === m.row) return segments; // back to magic
+      const nKey = nc + "," + nr;
+      const nt = tiles.get(nKey);
+      if (!nt) return segments; // off-grid
+      const visitKey = nKey + "|" + enterSide;
+      if (visited.has(visitKey)) return segments;
+      visited.add(visitKey);
+      const arcName = arcAtSide(nt.rotDeg, enterSide);
+      const u = rotUnit(nt.rotDeg);
+      const lEnter = ((enterSide - u) % 6 + 6) % 6;
+      const exitWorld = partnerSide(nt.rotDeg, enterSide);
+      const lExit = ((exitWorld - u) % 6 + 6) % 6;
+      segments.push({ tile: nt, arcName, lEnter, lExit, length: ARC_GEOM[arcName].length });
+      c = nc; r = nr; exitSide = exitWorld;
+    }
+    return segments;
+  }
+
+  let pulseLayer = null;
+  const pulses = [];
+  let pulseEmitCounter = 0;
+  let pulseRAF = null;
+
+  function setupPulseLayer() {
+    pulseLayer = document.createElementNS(SVG_NS, "g");
+    pulseLayer.setAttribute("class", "pulse-layer");
+    pulseLayer.style.pointerEvents = "none";
+    svg.appendChild(pulseLayer);
+  }
+
+  function emitPulse(startSide) {
+    if (!pulseLayer) return;
+    const segments = buildPulseSegments(startSide);
+    if (!segments || segments.length === 0) return;
+    let total = 0;
+    for (const s of segments) total += s.length;
+    // Color: sample the first arc's current colored fill; fall back to ROYGBV index.
+    const firstArc = segments[0].tile.arcs[segments[0].arcName];
+    let color = firstArc.getAttribute("fill");
+    if (!color || color === BAND_FILL) color = COLORS[startSide % COLORS.length];
+    const circle = document.createElementNS(SVG_NS, "circle");
+    circle.setAttribute("r", PULSE_RADIUS.toFixed(2));
+    circle.setAttribute("fill", color);
+    pulseLayer.appendChild(circle);
+    pulses.push({
+      startTime: performance.now(),
+      segments, totalLength: total, color, circle,
+    });
+    if (pulseRAF === null) pulseRAF = requestAnimationFrame(stepPulses);
+  }
+
+  function stepPulses() {
+    pulseRAF = null;
+    if (pulses.length === 0) return;
+    const now = performance.now();
+    for (let i = pulses.length - 1; i >= 0; i--) {
+      const p = pulses[i];
+      const traveled = ((now - p.startTime) / 1000) * PULSE_SPEED;
+      if (traveled >= p.totalLength) {
+        p.circle.remove();
+        pulses.splice(i, 1);
+        continue;
+      }
+      let s = traveled, idx = 0;
+      while (idx < p.segments.length && s > p.segments[idx].length) {
+        s -= p.segments[idx].length;
+        idx++;
+      }
+      if (idx >= p.segments.length) {
+        p.circle.remove();
+        pulses.splice(i, 1);
+        continue;
+      }
+      const [wx, wy] = pulsePoint(p.segments[idx], s);
+      p.circle.setAttribute("cx", wx.toFixed(2));
+      p.circle.setAttribute("cy", wy.toFixed(2));
+    }
+    if (pulses.length > 0) pulseRAF = requestAnimationFrame(stepPulses);
+  }
+
+  function clearPulses() {
+    for (const p of pulses) p.circle.remove();
+    pulses.length = 0;
+    if (pulseRAF !== null) { cancelAnimationFrame(pulseRAF); pulseRAF = null; }
+  }
+
+  // Start the once-per-second emitter (idempotent — only attach once).
+  let pulseInterval = null;
+  function startPulseEmitter() {
+    if (pulseInterval !== null) return;
+    pulseInterval = setInterval(() => {
+      const side = pulseEmitCounter % 6;
+      pulseEmitCounter++;
+      emitPulse(side);
+    }, PULSE_PERIOD_MS);
+  }
+
   // Rotate a single tile by +60° (clockwise on screen).
   function rotateTile(t) {
     t.rotDeg += 60;
@@ -416,6 +581,7 @@
   let magicKey = null;
 
   function build() {
+    clearPulses();
     while (svg.firstChild) svg.removeChild(svg.firstChild);
     tiles.clear();
 
@@ -463,9 +629,11 @@
     }
 
     colorize();
+    setupPulseLayer();
   }
 
   build();
+  startPulseEmitter();
 
   let resizeTimer = null;
   window.addEventListener("resize", () => {
