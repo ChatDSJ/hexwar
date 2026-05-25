@@ -206,6 +206,7 @@
       col, row, cx, cy, group: g, inner,
       rotDeg,
       arcs: { A: arcAEl, B: arcBEl, C: arcCEl },
+      halo,
       isMagic: false,
       colorNodes: null, // populated when marked magic
     };
@@ -287,7 +288,8 @@
 
   const HEX_WIDTH = 2 * R;             // flat-top hex vertex-to-vertex distance
   const PULSE_SPEED = HEX_WIDTH;       // pixels per second
-  const PULSE_RADIUS = 0.625 * RIBBON; // diameter = 1.25 * ribbon width
+  // diameter = 1.25 * ribbon width, then 25% larger (David, 2026-05-25)
+  const PULSE_RADIUS = 0.625 * RIBBON * 1.25;
   const PULSE_PERIOD_MS = 1000;        // one pulse per second
 
   // For each local arc, precompute which endpoint (a1 or a2) is at which local
@@ -317,19 +319,36 @@
     C: { arc: C, ends: endpointMap(C, [3, 5]), sweep: arcSweep(C), length: C.r * arcSweep(C) },
   };
 
-  // Compute world (svg) position of a point on a pulse segment at arclength `s`.
-  function pulsePoint(seg, s) {
+  // Compute local (pre-tile-rotation) coords of a point on a pulse segment at
+  // arclength `s` from its entry side. Pulses are children of `tile.inner`, so
+  // the tile's translate+rotate transform handles the world placement for us —
+  // and crucially the pulse z-orders naturally within the per-tile Celtic-knot
+  // stack (under-arcs hidden by over-arcs).
+  function pulseLocalPoint(seg, s) {
     const g = ARC_GEOM[seg.arcName];
     const startKey = g.ends[seg.lEnter];          // "a1" or "a2"
     const startAng = startKey === "a1" ? g.arc.a1 : g.arc.a2;
     const sign = startKey === "a1" ? +1 : -1;
     const ang = startAng + sign * (s / g.arc.r);
-    const lx = g.arc.center[0] + g.arc.r * Math.cos(ang);
-    const ly = g.arc.center[1] + g.arc.r * Math.sin(ang);
-    const t = seg.tile;
-    const a = t.rotDeg * Math.PI / 180;
-    const ca = Math.cos(a), sa = Math.sin(a);
-    return [t.cx + ca * lx - sa * ly, t.cy + sa * lx + ca * ly];
+    return [g.arc.center[0] + g.arc.r * Math.cos(ang),
+            g.arc.center[1] + g.arc.r * Math.sin(ang)];
+  }
+
+  // Insert the pulse circle at the correct z-position for the tile's draw stack:
+  //   C (under)  →  halo  →  B (over)  →  A (top)
+  // A pulse on arc X sits immediately AFTER the arc element so it rides that
+  // arc, and is naturally occluded by anything drawn over it (e.g. arc A draws
+  // over a pulse on arc B at the same crossing).
+  function placePulseInTile(circle, tile, arcName) {
+    if (arcName === "A") {
+      tile.inner.appendChild(circle);
+    } else if (arcName === "B") {
+      tile.inner.insertBefore(circle, tile.arcs.A);
+    } else {
+      // arcName === "C"  →  pulse must sit under the halo so the over/under
+      // illusion at C-crossings stays intact.
+      tile.inner.insertBefore(circle, tile.halo);
+    }
   }
 
   // Build the segment list for a pulse emerging from magic-tile side `startSide`.
@@ -365,26 +384,18 @@
     return segments;
   }
 
-  let pulseLayer = null;
   const pulses = [];
   let pulseEmitCounter = 0;
   let pulseRAF = null;
 
-  function setupPulseLayer() {
-    pulseLayer = document.createElementNS(SVG_NS, "g");
-    pulseLayer.setAttribute("class", "pulse-layer");
-    pulseLayer.style.pointerEvents = "none";
-    svg.appendChild(pulseLayer);
-  }
-
   function emitPulse(startSide) {
-    if (!pulseLayer) return;
     const segments = buildPulseSegments(startSide);
     if (!segments || segments.length === 0) return;
     let total = 0;
     for (const s of segments) total += s.length;
     // Color: sample the first arc's current colored fill; fall back to ROYGBV index.
-    const firstArc = segments[0].tile.arcs[segments[0].arcName];
+    const firstSeg = segments[0];
+    const firstArc = firstSeg.tile.arcs[firstSeg.arcName];
     let color = firstArc.getAttribute("fill");
     if (!color || color === BAND_FILL) color = COLORS[startSide % COLORS.length];
     const circle = document.createElementNS(SVG_NS, "circle");
@@ -392,10 +403,12 @@
     circle.setAttribute("fill", color);
     circle.setAttribute("stroke", BAND_EDGE);
     circle.setAttribute("stroke-width", "1.2");
-    pulseLayer.appendChild(circle);
+    circle.style.pointerEvents = "none";
+    placePulseInTile(circle, firstSeg.tile, firstSeg.arcName);
     pulses.push({
       startTime: performance.now(),
       segments, totalLength: total, color, circle,
+      curIdx: 0, // index of the segment currently parenting the circle
     });
     if (pulseRAF === null) pulseRAF = requestAnimationFrame(stepPulses);
   }
@@ -422,9 +435,15 @@
         pulses.splice(i, 1);
         continue;
       }
-      const [wx, wy] = pulsePoint(p.segments[idx], s);
-      p.circle.setAttribute("cx", wx.toFixed(2));
-      p.circle.setAttribute("cy", wy.toFixed(2));
+      // Reparent into the new tile/arc if we've moved on.
+      if (idx !== p.curIdx) {
+        const seg = p.segments[idx];
+        placePulseInTile(p.circle, seg.tile, seg.arcName);
+        p.curIdx = idx;
+      }
+      const [lx, ly] = pulseLocalPoint(p.segments[idx], s);
+      p.circle.setAttribute("cx", lx.toFixed(2));
+      p.circle.setAttribute("cy", ly.toFixed(2));
     }
     if (pulses.length > 0) pulseRAF = requestAnimationFrame(stepPulses);
   }
@@ -631,7 +650,6 @@
     }
 
     colorize();
-    setupPulseLayer();
   }
 
   build();
