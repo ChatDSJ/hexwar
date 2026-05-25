@@ -360,7 +360,6 @@
   const pulses = [];
   let pulseEmitCounter = 0;
   let pulseRAF = null;
-  const PULSE_MAX_AGE_MS = 60000; // safety cap for non-terminating loops
 
   // Build a fresh segment state object for a pulse just entering `tile` from
   // world side `worldEnter`. Returns null if the entry isn't a real ribbon arc
@@ -400,7 +399,7 @@
 
     const now = performance.now();
     pulses.push({
-      color, circle, s: 0, lastT: now, bornAt: now,
+      color, circle, s: 0, lastT: now,
       ...seg,
     });
     if (pulseRAF === null) pulseRAF = requestAnimationFrame(stepPulses);
@@ -413,9 +412,6 @@
     const m = magicKey ? tiles.get(magicKey) : null;
     for (let i = pulses.length - 1; i >= 0; i--) {
       const p = pulses[i];
-      if (now - p.bornAt > PULSE_MAX_AGE_MS) {
-        p.circle.remove(); pulses.splice(i, 1); continue;
-      }
       const dt = (now - p.lastT) / 1000;
       p.lastT = now;
       p.s += dt * PULSE_SPEED;
