@@ -360,6 +360,68 @@
   const pulses = [];
   let pulseEmitCounter = 0;
   let pulseRAF = null;
+  let mstLayer = null;
+
+  // World-space (svg viewBox) position of a pulse at its current `s`.
+  function pulseWorld(p) {
+    const [lx, ly] = pulseLocalPoint({ arcName: p.arcName, lEnter: p.lEnter }, p.s);
+    const a = p.tile.rotDeg * Math.PI / 180;
+    const ca = Math.cos(a), sa = Math.sin(a);
+    return [p.tile.cx + ca * lx - sa * ly, p.tile.cy + sa * lx + ca * ly];
+  }
+
+  // Faintly draw the Euclidean MST over the current set of live pulses.
+  // Prim's O(n^2) is plenty here — n is bounded by emission rate × loop length.
+  function drawMST() {
+    if (!mstLayer) return;
+    const n = pulses.length;
+    if (n < 2) {
+      while (mstLayer.firstChild) mstLayer.removeChild(mstLayer.firstChild);
+      return;
+    }
+    const pts = new Array(n);
+    for (let i = 0; i < n; i++) pts[i] = pulseWorld(pulses[i]);
+    const inTree = new Uint8Array(n);
+    const minD = new Float64Array(n);
+    const minFrom = new Int32Array(n);
+    inTree[0] = 1; minFrom[0] = -1; minD[0] = 0;
+    for (let i = 1; i < n; i++) {
+      const dx = pts[i][0] - pts[0][0], dy = pts[i][1] - pts[0][1];
+      minD[i] = dx * dx + dy * dy; minFrom[i] = 0;
+    }
+    const edges = [];
+    for (let k = 1; k < n; k++) {
+      let best = -1, bd = Infinity;
+      for (let i = 0; i < n; i++) {
+        if (!inTree[i] && minD[i] < bd) { bd = minD[i]; best = i; }
+      }
+      if (best < 0) break;
+      edges.push([minFrom[best], best]);
+      inTree[best] = 1;
+      const bx = pts[best][0], by = pts[best][1];
+      for (let i = 0; i < n; i++) {
+        if (inTree[i]) continue;
+        const dx = pts[i][0] - bx, dy = pts[i][1] - by;
+        const d = dx * dx + dy * dy;
+        if (d < minD[i]) { minD[i] = d; minFrom[i] = best; }
+      }
+    }
+    // Reuse existing <line> elements; create or remove as needed.
+    const want = edges.length;
+    while (mstLayer.childNodes.length > want) mstLayer.removeChild(mstLayer.lastChild);
+    while (mstLayer.childNodes.length < want) {
+      const ln = document.createElementNS(SVG_NS, "line");
+      mstLayer.appendChild(ln);
+    }
+    for (let e = 0; e < want; e++) {
+      const [a, b] = edges[e];
+      const ln = mstLayer.childNodes[e];
+      ln.setAttribute("x1", pts[a][0].toFixed(2));
+      ln.setAttribute("y1", pts[a][1].toFixed(2));
+      ln.setAttribute("x2", pts[b][0].toFixed(2));
+      ln.setAttribute("y2", pts[b][1].toFixed(2));
+    }
+  }
 
   // Build a fresh segment state object for a pulse just entering `tile` from
   // world side `worldEnter`. We store LOCAL sides only — `worldExit` is computed
@@ -449,7 +511,9 @@
       p.circle.setAttribute("cx", lx.toFixed(2));
       p.circle.setAttribute("cy", ly.toFixed(2));
     }
+    drawMST();
     if (pulses.length > 0) pulseRAF = requestAnimationFrame(stepPulses);
+    else if (mstLayer) while (mstLayer.firstChild) mstLayer.removeChild(mstLayer.firstChild);
   }
 
   function clearPulses() {
@@ -652,6 +716,15 @@
       // any neighboring ribbons.
       svg.appendChild(magicTile.group);
     }
+
+    // MST layer sits on top — faint lines connecting live pulses.
+    mstLayer = document.createElementNS(SVG_NS, "g");
+    mstLayer.setAttribute("class", "mst-layer");
+    mstLayer.setAttribute("stroke", BAND_EDGE);
+    mstLayer.setAttribute("stroke-width", "1");
+    mstLayer.setAttribute("stroke-opacity", "0.3");
+    mstLayer.style.pointerEvents = "none";
+    svg.appendChild(mstLayer);
 
     colorize();
   }
