@@ -16,6 +16,7 @@
   body { font-family: system-ui, sans-serif; -webkit-tap-highlight-color: transparent; }
   svg#field { display: block; width: 100vw; height: 100vh; cursor: pointer; touch-action: none; user-select: none; -webkit-user-select: none; }
   .drag-rect { pointer-events: none; }
+  body.searching .tile-inner { transition: none !important; }
   .tile-inner { transition: transform 450ms cubic-bezier(.22,.61,.36,1); transform-origin: 0 0; will-change: transform; }
   .tile { cursor: pointer; }
   .tile:hover .hex-outline { stroke: rgba(58,54,46,0.42); }
@@ -210,6 +211,72 @@
     };
     g.__tileObj = tile;
     return tile;
+  }
+
+  // Count how many ribbon arcs are currently colored (not at BAND_FILL).
+  function countColoredArcs() {
+    let n = 0;
+    for (const t of tiles.values()) {
+      if (t.isMagic) continue;
+      for (const k of ["A", "B", "C"]) {
+        if (t.arcs[k].getAttribute("fill") !== BAND_FILL) n++;
+      }
+    }
+    return n;
+  }
+
+  // Click on the magic tile triggers a 3-second random search for the rotation
+  // configuration that maximizes the number of colored ribbon arcs. The live DOM
+  // is mutated in-place — accepted improvements stay, rejected trials revert —
+  // so the screen always shows the current best-so-far.
+  let searching = false;
+  async function searchBestConfig(durationMs = 3000) {
+    if (searching) return;
+    searching = true;
+    document.body.classList.add("searching");
+    const candidates = [];
+    for (const t of tiles.values()) if (!t.isMagic) candidates.push(t);
+    let bestScore = countColoredArcs();
+    const deadline = performance.now() + durationMs;
+    let iters = 0, improvements = 0;
+    while (performance.now() < deadline) {
+      // Perturb 1..3 random tiles by a random multiple of 60°.
+      const k = 1 + Math.floor(Math.random() * 3);
+      const changes = [];
+      for (let i = 0; i < k; i++) {
+        const t = candidates[Math.floor(Math.random() * candidates.length)];
+        const prev = t.rotDeg;
+        const steps = 1 + Math.floor(Math.random() * 5);
+        t.rotDeg = prev + steps * 60;
+        t.inner.style.transform = `rotate(${t.rotDeg}deg)`;
+        changes.push([t, prev]);
+      }
+      colorize();
+      const s = countColoredArcs();
+      if (s > bestScore) {
+        bestScore = s;
+        improvements++;
+        for (const [t] of changes) {
+          rotationByCell.set(t.col + "," + t.row, ((t.rotDeg % 360) + 360) % 360);
+        }
+      } else {
+        // Revert in reverse order to handle the case of the same tile twice.
+        for (let i = changes.length - 1; i >= 0; i--) {
+          const [t, prev] = changes[i];
+          t.rotDeg = prev;
+          t.inner.style.transform = `rotate(${t.rotDeg}deg)`;
+        }
+        colorize();
+      }
+      iters++;
+      // Yield to the browser so paint can flush and the user sees the best-so-far.
+      if (iters % 5 === 0) {
+        await new Promise(r => setTimeout(r, 0));
+      }
+    }
+    document.body.classList.remove("searching");
+    searching = false;
+    console.log(`search: iters=${iters} improvements=${improvements} score=${bestScore}`);
   }
 
   // Rotate a single tile by +60° (clockwise on screen).
@@ -420,6 +487,7 @@
   }
 
   svg.addEventListener("pointerdown", (e) => {
+    if (searching) return;
     if (e.pointerType === "mouse" && e.button !== 0) return;
     e.preventDefault();
     try { svg.setPointerCapture(e.pointerId); } catch (_) {}
@@ -480,8 +548,12 @@
       if (drag.rectEl) drag.rectEl.remove();
       if (any) colorize();
     } else if (drag.startTile) {
-      rotateTile(drag.startTile);
-      colorize();
+      if (drag.startTile.isMagic) {
+        searchBestConfig();
+      } else {
+        rotateTile(drag.startTile);
+        colorize();
+      }
     }
     drag = null;
   }
