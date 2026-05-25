@@ -364,6 +364,15 @@
   let mstLayer = null;
   let SHOW_MST = false; // hidden by default (David, 2026-05-25); MST code still active
 
+  // ---------- Zoom / pan state ----------
+  // World coordinates of tile centers are stable (tile.cx, tile.cy = col*dx, row*dy + xShift).
+  // Visual zoom is applied via a top-level <g class="world"> transform on the svg.
+  // Screen point S = (panX + Z*worldX, panY + Z*worldY). The magic hex is always clamped
+  // to remain visible.
+  let worldG = null;
+  let Z = 1, panX = 0, panY = 0;
+  const ZOOM_MIN = 0.35, ZOOM_MAX = 4.0;
+
   // World-space (svg viewBox) position of a pulse at its current `s`.
   function pulseWorld(p) {
     const [lx, ly] = pulseLocalPoint({ arcName: p.arcName, lEnter: p.lEnter }, p.s);
@@ -802,53 +811,160 @@
     svg.setAttribute("width", W);
     svg.setAttribute("height", H);
 
-    const colMin = Math.floor((-R) / dx) - 1;
-    const colMax = Math.ceil((W + R) / dx) + 1;
-    const rowMin = Math.floor((-R) / dy) - 1;
-    const rowMax = Math.ceil((H + R) / dy) + 1;
+    // World group: holds all tiles + mst layer; we apply pan/zoom transform here.
+    worldG = document.createElementNS(SVG_NS, "g");
+    worldG.setAttribute("class", "world");
+    svg.appendChild(worldG);
+    // On rebuild (e.g. resize), reset pan; preserve current Z so user-set zoom
+    // survives a window resize.
+    panX = 0; panY = 0;
+
+    // Initial visible world box at current Z (before any pan, world point at
+    // screen origin is just (0,0)/Z = origin shifted; with panX=panY=0 it's
+    // (0..W/Z, 0..H/Z) in world coords).
+    const box = visibleWorldBox(R);
 
     let bestKey = null, bestD = Infinity;
-    const cxCenter = W / 2, cyCenter = H / 2;
+    const wxCenter = (W / 2) / Z, wyCenter = (H / 2) / Z;
 
     const frag = document.createDocumentFragment();
+    const colMin = Math.floor(box.x0 / dx) - 1;
+    const colMax = Math.ceil(box.x1 / dx) + 1;
+    const rowMin = Math.floor(box.y0 / dy) - 1;
+    const rowMax = Math.ceil(box.y1 / dy) + 1;
     for (let col = colMin; col <= colMax; col++) {
       const xShift = (Math.abs(col) % 2 === 1) ? dy / 2 : 0;
       for (let row = rowMin; row <= rowMax; row++) {
         const cx = col * dx;
         const cy = row * dy + xShift;
-        if (cx < -R - 2 || cx > W + R + 2) continue;
-        if (cy < -R - 2 || cy > H + R + 2) continue;
+        if (cx + R < box.x0 || cx - R > box.x1) continue;
+        if (cy + R < box.y0 || cy - R > box.y1) continue;
         const t = makeTile(cx, cy, getRotation(col, row), col, row);
         tiles.set(col + "," + row, t);
         frag.appendChild(t.group);
-        // Track closest tile to viewport center for the magic role
-        const dxC = cx - cxCenter, dyC = cy - cyCenter;
+        const dxC = cx - wxCenter, dyC = cy - wyCenter;
         const d = dxC * dxC + dyC * dyC;
         if (d < bestD) { bestD = d; bestKey = col + "," + row; }
       }
     }
-    svg.appendChild(frag);
+    worldG.appendChild(frag);
 
-    // Promote center tile to magic, append its dots layer last (so they render last).
     magicKey = bestKey;
     if (magicKey) {
       const magicTile = tiles.get(magicKey);
       makeMagic(magicTile);
-      // Lift magic tile to end of svg children so its color dots render on top of
-      // any neighboring ribbons.
-      svg.appendChild(magicTile.group);
+      worldG.appendChild(magicTile.group); // keep on top
     }
 
-    // MST layer sits on top — faint lines connecting live pulses.
     mstLayer = document.createElementNS(SVG_NS, "g");
     mstLayer.setAttribute("class", "mst-layer");
     mstLayer.setAttribute("stroke", BAND_EDGE);
     mstLayer.setAttribute("stroke-width", "1");
     mstLayer.setAttribute("stroke-opacity", "0.3");
     mstLayer.style.pointerEvents = "none";
-    svg.appendChild(mstLayer);
+    worldG.appendChild(mstLayer);
 
+    applyZoomTransform();
     colorize();
+  }
+
+  // ---------- Zoom / pan helpers ----------
+  function applyZoomTransform() {
+    if (worldG) worldG.setAttribute("transform", `translate(${panX}, ${panY}) scale(${Z})`);
+  }
+
+  function visibleWorldBox(margin = 0) {
+    const W = window.innerWidth, H = window.innerHeight;
+    const x0 = (-panX) / Z - margin;
+    const y0 = (-panY) / Z - margin;
+    const x1 = (W - panX) / Z + margin;
+    const y1 = (H - panY) / Z + margin;
+    return { x0, y0, x1, y1 };
+  }
+
+  function clampPanToKeepMagic() {
+    const m = magicKey ? tiles.get(magicKey) : null;
+    if (!m) return;
+    const W = window.innerWidth, H = window.innerHeight;
+    const margin = R * Z; // require the whole magic hex to remain visible
+    const sx = panX + Z * m.cx;
+    const sy = panY + Z * m.cy;
+    if (sx < margin)        panX += (margin - sx);
+    else if (sx > W - margin) panX -= (sx - (W - margin));
+    if (sy < margin)        panY += (margin - sy);
+    else if (sy > H - margin) panY -= (sy - (H - margin));
+  }
+
+  function setZoomAt(newZ, screenX, screenY) {
+    newZ = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, newZ));
+    if (newZ === Z) return false;
+    // Keep the world point under (screenX, screenY) fixed during the zoom.
+    const wx = (screenX - panX) / Z;
+    const wy = (screenY - panY) / Z;
+    Z = newZ;
+    panX = screenX - Z * wx;
+    panY = screenY - Z * wy;
+    clampPanToKeepMagic();
+    applyZoomTransform();
+    ensureTilesForBox(visibleWorldBox(R));
+    return true;
+  }
+
+  function ensureTilesForBox(box) {
+    const colMin = Math.floor(box.x0 / dx) - 1;
+    const colMax = Math.ceil(box.x1 / dx) + 1;
+    const rowMin = Math.floor(box.y0 / dy) - 1;
+    const rowMax = Math.ceil(box.y1 / dy) + 1;
+    const frag = document.createDocumentFragment();
+    let added = false;
+    for (let col = colMin; col <= colMax; col++) {
+      const xShift = (Math.abs(col) % 2 === 1) ? dy / 2 : 0;
+      for (let row = rowMin; row <= rowMax; row++) {
+        const k = col + "," + row;
+        if (tiles.has(k)) continue;
+        const cx = col * dx;
+        const cy = row * dy + xShift;
+        if (cx + R < box.x0 || cx - R > box.x1) continue;
+        if (cy + R < box.y0 || cy - R > box.y1) continue;
+        const t = makeTile(cx, cy, getRotation(col, row), col, row);
+        tiles.set(k, t);
+        frag.appendChild(t.group);
+        added = true;
+      }
+    }
+    if (added && worldG) {
+      // Keep magic tile last so its color dots render on top.
+      if (magicKey && tiles.has(magicKey)) {
+        worldG.insertBefore(frag, tiles.get(magicKey).group);
+      } else {
+        worldG.appendChild(frag);
+      }
+    }
+    return added;
+  }
+
+  function cleanupTilesOutsideBox(box) {
+    const toRemove = [];
+    for (const [k, t] of tiles) {
+      if (k === magicKey) continue;
+      if (t.cx + R < box.x0 || t.cx - R > box.x1 ||
+          t.cy + R < box.y0 || t.cy - R > box.y1) {
+        toRemove.push([k, t]);
+      }
+    }
+    if (!toRemove.length) return false;
+    for (const [k, t] of toRemove) {
+      // Drop any pulses on this tile (their tile is going away).
+      for (let i = pulses.length - 1; i >= 0; i--) {
+        if (pulses[i].tile === t) {
+          if (pulses[i].circle.parentNode) pulses[i].circle.parentNode.removeChild(pulses[i].circle);
+          pulses.splice(i, 1);
+        }
+      }
+      t.group.remove();
+      tiles.delete(k);
+    }
+    return true;
   }
 
   build();
@@ -876,6 +992,7 @@
 
   svg.addEventListener("pointerdown", (e) => {
     if (searching) return;
+    if (pinch || activePointers.size >= 2) return; // pinch gesture in progress
     if (e.pointerType === "mouse" && e.button !== 0) return;
     e.preventDefault();
     try { svg.setPointerCapture(e.pointerId); } catch (_) {}
@@ -891,6 +1008,7 @@
   });
 
   svg.addEventListener("pointermove", (e) => {
+    if (pinch) return;
     if (!drag || e.pointerId !== drag.pointerId) return;
     const [cx, cy] = clientToSvg(e.clientX, e.clientY);
     const dx = cx - drag.startX, dy = cy - drag.startY;
@@ -927,8 +1045,11 @@
       const x2 = Math.max(drag.startX, ex);
       const y2 = Math.max(drag.startY, ey);
       let any = false;
+      // Tile centers are in world coords; convert to screen for hit test.
       for (const t of tiles.values()) {
-        if (t.cx >= x1 && t.cx <= x2 && t.cy >= y1 && t.cy <= y2) {
+        const sx = panX + Z * t.cx;
+        const sy = panY + Z * t.cy;
+        if (sx >= x1 && sx <= x2 && sy >= y1 && sy <= y2) {
           rotateTile(t);
           any = true;
         }
@@ -956,6 +1077,90 @@
   // Suppress default touch behaviors that would interrupt drag (page pan/pinch)
   svg.addEventListener("touchstart", (e) => e.preventDefault(), { passive: false });
   svg.addEventListener("touchmove",  (e) => e.preventDefault(), { passive: false });
+
+  // ---------- Zoom: mouse wheel (desktop) + 2-finger pinch (mobile) ----------
+  // We attach an extra layer of pointer + wheel listeners. Pinch detection uses
+  // the pointer-events API (any pointerType): when two pointers are simultaneously
+  // active on the svg, we switch into pinch mode, cancel any in-progress drag,
+  // and update Z + pan from the changing distance & midpoint of the two pointers.
+  // After zoom gestures finish, we clean up tiles entirely outside the viewport.
+  const activePointers = new Map(); // pointerId -> {x, y}
+  let pinch = null;                 // {startDist, startZ, startCenter:{x,y}, startMidWorld:{x,y}}
+  let zoomEndTimer = null;
+  function scheduleZoomEnd() {
+    clearTimeout(zoomEndTimer);
+    zoomEndTimer = setTimeout(() => {
+      cleanupTilesOutsideBox(visibleWorldBox(R));
+      colorize();
+    }, 200);
+  }
+
+  function cancelInProgressDrag() {
+    if (drag) {
+      if (drag.rectEl && drag.rectEl.parentNode) drag.rectEl.remove();
+      try { svg.releasePointerCapture(drag.pointerId); } catch (_) {}
+      drag = null;
+    }
+  }
+
+  function beginPinch() {
+    const pts = [...activePointers.values()];
+    if (pts.length < 2) return;
+    const [a, b] = pts;
+    const cx = (a.x + b.x) / 2, cy = (a.y + b.y) / 2;
+    pinch = {
+      startDist: Math.hypot(a.x - b.x, a.y - b.y) || 1,
+      startZ: Z,
+      startCenter: { x: cx, y: cy },
+      startMidWorld: { x: (cx - panX) / Z, y: (cy - panY) / Z },
+    };
+    cancelInProgressDrag();
+  }
+
+  function updatePinch() {
+    if (!pinch) return;
+    const pts = [...activePointers.values()];
+    if (pts.length < 2) return;
+    const [a, b] = pts;
+    const dist = Math.hypot(a.x - b.x, a.y - b.y) || 1;
+    const cx = (a.x + b.x) / 2, cy = (a.y + b.y) / 2;
+    let newZ = pinch.startZ * (dist / pinch.startDist);
+    newZ = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, newZ));
+    Z = newZ;
+    // Keep the pinch midpoint world position aligned with current screen midpoint.
+    panX = cx - Z * pinch.startMidWorld.x;
+    panY = cy - Z * pinch.startMidWorld.y;
+    clampPanToKeepMagic();
+    applyZoomTransform();
+    ensureTilesForBox(visibleWorldBox(R));
+  }
+
+  svg.addEventListener("pointerdown", (e) => {
+    activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (activePointers.size >= 2 && !pinch) beginPinch();
+  }, true); // capture phase so we see it before the drag listener
+  svg.addEventListener("pointermove", (e) => {
+    if (activePointers.has(e.pointerId)) {
+      activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      if (pinch) updatePinch();
+    }
+  }, true);
+  function endPointer(e) {
+    activePointers.delete(e.pointerId);
+    if (pinch && activePointers.size < 2) {
+      pinch = null;
+      scheduleZoomEnd();
+    }
+  }
+  svg.addEventListener("pointerup", endPointer, true);
+  svg.addEventListener("pointercancel", endPointer, true);
+
+  // Wheel: classic desktop zoom. Anchored on cursor; subtle exponential mapping.
+  svg.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    const factor = Math.exp(-e.deltaY * 0.0015);
+    if (setZoomAt(Z * factor, e.clientX, e.clientY)) scheduleZoomEnd();
+  }, { passive: false });
 })();
 </script>
 </body>
