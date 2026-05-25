@@ -18,13 +18,16 @@
   .drag-rect { pointer-events: none; }
   /* (search runs in logical state; transitions stay on so improvements animate) */
   /* During optimization, each color node slides radially outward so its center
-     ends up on the hex edge midpoint, then slides back. The translate amount
-     is set per-dot via --out-dx / --out-dy (user-space units) when the magic
-     tile is built. The animation runs once over the full search duration:
-     0% → home, 50% → on-edge, 100% → home. */
+     ends up on the hex edge midpoint, holds there, then slides back. The
+     translate amount is set per-dot via --out-dx / --out-dy (user-space units)
+     when the magic tile is built. The animation runs once over the full
+     search duration and is split into four equal-length phases:
+       0%  →  25%  : moving outward
+      25%  →  75%  : holding on the hex edge
+      75%  → 100%  : moving back to home. */
   @keyframes magic-node-radial {
     0%, 100% { transform: translate(0px, 0px); }
-    50%      { transform: translate(var(--out-dx, 0px), var(--out-dy, 0px)); }
+    25%, 75% { transform: translate(var(--out-dx, 0px), var(--out-dy, 0px)); }
   }
   .color-nodes .node-dot {
     transform-box: fill-box;
@@ -47,7 +50,7 @@
 <div id="mode-banner"></div>
 <script>
 (() => {
-  const APP_VERSION = "v10-radial-slide-desktop-2x-2026-05-25-2125";
+  const APP_VERSION = "v11-radial-4phase-2026-05-25-2127";
   console.log("hexwar app version:", APP_VERSION);
   const SVG_NS = "http://www.w3.org/2000/svg";
   const svg = document.getElementById("field");
