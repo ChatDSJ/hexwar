@@ -53,7 +53,7 @@
 <div id="mode-banner"></div>
 <script>
 (() => {
-  const APP_VERSION = "v14-constant-angular-velocity-2026-05-26-0915";
+  const APP_VERSION = "v15-pulse-halt-resume-2026-05-26-0945";
   console.log("hexwar app version:", APP_VERSION);
   const SVG_NS = "http://www.w3.org/2000/svg";
   const svg = document.getElementById("field");
@@ -261,6 +261,15 @@
   async function searchBestConfig(durationMs = 3000, modeIdx = currentMode) {
     if (searching) return;
     searching = true;
+
+    // Halt phase (David, 2026-05-26): pulses decelerate to a stop over 500ms,
+    // emission is suspended, THEN the optimization runs. After optimization we
+    // ramp pulses back up over 500ms. The radial-slide CSS class is bound to
+    // the optimization window only (not the halt/resume) so the magic-node
+    // animation still lands at translate(0,0) exactly when the search ends.
+    pulsesHalted = true;
+    await rampPulseSpeed(1, 0, 500);
+
     // Bind the radial-slide animation duration to the actual search duration so
     // dots reach the edge at the midpoint and return home as the search ends.
     document.body.style.setProperty("--magic-anim-duration", durationMs + "ms");
@@ -375,6 +384,13 @@
     // animation duration elapses (matched to durationMs), so removing the
     // `searching` class drops cleanly back to the resting state — no jump.
     document.body.classList.remove("searching");
+
+    // Resume phase: pulses accelerate back to full speed over 500ms; emission
+    // resumes immediately (new pulses share `pulseSpeedScale` so they ramp up
+    // alongside the survivors).
+    pulsesHalted = false;
+    await rampPulseSpeed(0, 1, 500);
+
     searching = false;
     updateModeBanner(modeIdx, everBest, `${iters} trials, +${improvements}`);
     console.log(`search mode=${modeIdx} (${mode.name}): iters=${iters} improvements=${improvements} perturbations=${perturbations} restored=${restored} score=${everBest}`);
@@ -391,6 +407,26 @@
   // diameter = 1.25 * ribbon width, then 25% larger (David, 2026-05-25)
   const PULSE_RADIUS = 0.625 * RIBBON * 1.25;
   const PULSE_PERIOD_MS = 1000;        // one pulse per second
+
+  // Halt/resume control (David, 2026-05-26). When `searchBestConfig` starts we
+  // ramp `pulseSpeedScale` 1→0 over 500ms (pulses decelerate to a stop), run
+  // the optimization, then ramp 0→1 over 500ms (pulses accelerate back). New
+  // emission is suppressed while `pulsesHalted` is true so we don't pile
+  // motionless pulses on top of the magic tile's neighbors.
+  let pulseSpeedScale = 1;
+  let pulsesHalted = false;
+  function rampPulseSpeed(from, to, ms) {
+    return new Promise((resolve) => {
+      const start = performance.now();
+      function tick() {
+        const t = Math.min(1, (performance.now() - start) / ms);
+        pulseSpeedScale = from + (to - from) * t;
+        if (t >= 1) { resolve(); return; }
+        requestAnimationFrame(tick);
+      }
+      requestAnimationFrame(tick);
+    });
+  }
 
   // For each local arc, precompute which endpoint (a1 or a2) is at which local
   // side. The arc geometry is the same for every tile; only tile transforms differ.
@@ -595,7 +631,7 @@
       const p = pulses[i];
       const dt = (now - p.lastT) / 1000;
       p.lastT = now;
-      p.s += dt * PULSE_SPEED;
+      p.s += dt * PULSE_SPEED * pulseSpeedScale;
 
       let dead = false;
       while (p.s >= p.segLen) {
@@ -643,6 +679,7 @@
   function startPulseEmitter() {
     if (pulseInterval !== null) return;
     pulseInterval = setInterval(() => {
+      if (pulsesHalted) return; // suspend emission during search halt/resume
       const side = pulseEmitCounter % 6;
       pulseEmitCounter++;
       emitPulse(side);
