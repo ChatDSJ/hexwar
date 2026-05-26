@@ -38,8 +38,12 @@
   }
   /* Rotations animate at a constant angular velocity of 60° per 450ms (= 7.5ms/deg).
      Duration is set per-rotation in JS via setRotateAnim() so that a 120° rotation
-     takes 900ms, a 300° rotation takes 2250ms, etc. (David, 2026-05-26) */
-  .tile-inner { transition: transform 450ms cubic-bezier(.22,.61,.36,1); transform-origin: 0 0; will-change: transform; }
+     takes 900ms, a 300° rotation takes 2250ms, etc. (David, 2026-05-26)
+     NOTE: `will-change: transform` was removed (2026-05-26). With thousands of tiles
+     visible at low zoom each would have been promoted to its own compositor layer,
+     blowing GPU memory + scheduling cost. setRotateAnim() now adds `will-change`
+     only for the in-flight animation and removes it at transitionend. */
+  .tile-inner { transition: transform 450ms cubic-bezier(.22,.61,.36,1); transform-origin: 0 0; }
   .tile { cursor: pointer; }
   .tile:hover .hex-outline { stroke: rgba(58,54,46,0.42); }
   .hex-outline { transition: stroke 200ms ease; }
@@ -53,7 +57,7 @@
 <div id="mode-banner"></div>
 <script>
 (() => {
-  const APP_VERSION = "v16-wait-for-rotations-2026-05-26-1030";
+  const APP_VERSION = "v17-perf-cleanup-2026-05-26-1140";
   console.log("hexwar app version:", APP_VERSION);
   const SVG_NS = "http://www.w3.org/2000/svg";
   const svg = document.getElementById("field");
@@ -502,8 +506,6 @@
   const pulses = [];
   let pulseEmitCounter = 0;
   let pulseRAF = null;
-  let mstLayer = null;
-  let SHOW_MST = false; // hidden by default (David, 2026-05-25); MST code still active
 
   // ---------- Zoom / pan state ----------
   // World coordinates of tile centers are stable (tile.cx, tile.cy = col*dx, row*dy + xShift).
@@ -518,67 +520,6 @@
     && window.matchMedia("(pointer: fine)").matches;
   let Z = IS_DESKTOP ? 2 : 1, panX = 0, panY = 0;
   const ZOOM_MIN = 0.35, ZOOM_MAX = 4.0;
-
-  // World-space (svg viewBox) position of a pulse at its current `s`.
-  function pulseWorld(p) {
-    const [lx, ly] = pulseLocalPoint({ arcName: p.arcName, lEnter: p.lEnter }, p.s);
-    const a = p.tile.rotDeg * Math.PI / 180;
-    const ca = Math.cos(a), sa = Math.sin(a);
-    return [p.tile.cx + ca * lx - sa * ly, p.tile.cy + sa * lx + ca * ly];
-  }
-
-  // Faintly draw the Euclidean MST over the current set of live pulses.
-  // Prim's O(n^2) is plenty here — n is bounded by emission rate × loop length.
-  function drawMST() {
-    if (!mstLayer) return;
-    const n = pulses.length;
-    if (n < 2) {
-      while (mstLayer.firstChild) mstLayer.removeChild(mstLayer.firstChild);
-      return;
-    }
-    const pts = new Array(n);
-    for (let i = 0; i < n; i++) pts[i] = pulseWorld(pulses[i]);
-    const inTree = new Uint8Array(n);
-    const minD = new Float64Array(n);
-    const minFrom = new Int32Array(n);
-    inTree[0] = 1; minFrom[0] = -1; minD[0] = 0;
-    for (let i = 1; i < n; i++) {
-      const dx = pts[i][0] - pts[0][0], dy = pts[i][1] - pts[0][1];
-      minD[i] = dx * dx + dy * dy; minFrom[i] = 0;
-    }
-    const edges = [];
-    for (let k = 1; k < n; k++) {
-      let best = -1, bd = Infinity;
-      for (let i = 0; i < n; i++) {
-        if (!inTree[i] && minD[i] < bd) { bd = minD[i]; best = i; }
-      }
-      if (best < 0) break;
-      edges.push([minFrom[best], best]);
-      inTree[best] = 1;
-      const bx = pts[best][0], by = pts[best][1];
-      for (let i = 0; i < n; i++) {
-        if (inTree[i]) continue;
-        const dx = pts[i][0] - bx, dy = pts[i][1] - by;
-        const d = dx * dx + dy * dy;
-        if (d < minD[i]) { minD[i] = d; minFrom[i] = best; }
-      }
-    }
-    // Reuse existing <line> elements; create or remove as needed.
-    const want = edges.length;
-    while (mstLayer.childNodes.length > want) mstLayer.removeChild(mstLayer.lastChild);
-    while (mstLayer.childNodes.length < want) {
-      const ln = document.createElementNS(SVG_NS, "line");
-      mstLayer.appendChild(ln);
-    }
-    for (let e = 0; e < want; e++) {
-      const [a, b] = edges[e];
-      const ln = mstLayer.childNodes[e];
-      ln.setAttribute("x1", pts[a][0].toFixed(2));
-      ln.setAttribute("y1", pts[a][1].toFixed(2));
-      ln.setAttribute("x2", pts[b][0].toFixed(2));
-      ln.setAttribute("y2", pts[b][1].toFixed(2));
-    }
-  }
 
   // Build a fresh segment state object for a pulse just entering `tile` from
   // world side `worldEnter`. We store LOCAL sides only — `worldExit` is computed
@@ -668,10 +609,7 @@
       p.circle.setAttribute("cx", lx.toFixed(2));
       p.circle.setAttribute("cy", ly.toFixed(2));
     }
-    if (SHOW_MST) drawMST();
-    else if (mstLayer && mstLayer.firstChild) while (mstLayer.firstChild) mstLayer.removeChild(mstLayer.firstChild);
     if (pulses.length > 0) pulseRAF = requestAnimationFrame(stepPulses);
-    else if (mstLayer) while (mstLayer.firstChild) mstLayer.removeChild(mstLayer.firstChild);
   }
 
   function clearPulses() {
@@ -704,6 +642,20 @@
   function setRotateAnim(inner, deltaDeg) {
     const dur = Math.max(1, Math.round(Math.abs(deltaDeg) * MS_PER_DEG));
     inner.style.transitionDuration = dur + "ms";
+    // Promote ONLY this animating element to its own compositor layer for the
+    // duration of the rotation, then drop it on transitionend so static tiles
+    // don't each carry a layer (huge GPU savings at low zoom where there can be
+    // thousands of tiles). Idempotent: if a rotation is re-armed mid-flight the
+    // existing listener clears it once that final transition lands.
+    inner.style.willChange = "transform";
+    if (!inner.__rotCleanup) {
+      inner.__rotCleanup = (e) => {
+        if (e && e.propertyName !== "transform") return;
+        inner.style.willChange = "";
+      };
+      inner.addEventListener("transitionend", inner.__rotCleanup);
+      inner.addEventListener("transitioncancel", inner.__rotCleanup);
+    }
     const endAt = performance.now() + dur;
     if (endAt > lastRotateEndAt) lastRotateEndAt = endAt;
   }
@@ -784,10 +736,17 @@
     if (!magicTile) return;
 
     if (!silentColorize) {
-      // Reset all ribbon fills to default (skip the magic tile — it has no ribbons)
+      // Reset all ribbon fills to default (skip the magic tile — it has no ribbons).
+      // PERF: skip setAttribute when the arc is already at BAND_FILL — at low zoom
+      // there can be thousands of tiles and the vast majority sit at default. The
+      // attribute write itself is cheap, but it also re-arms the 420ms CSS fill
+      // transition machinery on every arc on every colorize, which adds up.
       for (const t of tiles.values()) {
         if (t.isMagic) continue;
-        for (const k of ["A", "B", "C"]) t.arcs[k].setAttribute("fill", BAND_FILL);
+        const arcs = t.arcs;
+        if (arcs.A.getAttribute("fill") !== BAND_FILL) arcs.A.setAttribute("fill", BAND_FILL);
+        if (arcs.B.getAttribute("fill") !== BAND_FILL) arcs.B.setAttribute("fill", BAND_FILL);
+        if (arcs.C.getAttribute("fill") !== BAND_FILL) arcs.C.setAttribute("fill", BAND_FILL);
       }
     }
     const nodeColors = [null, null, null, null, null, null];
@@ -1013,7 +972,7 @@
     svg.setAttribute("width", W);
     svg.setAttribute("height", H);
 
-    // World group: holds all tiles + mst layer; we apply pan/zoom transform here.
+    // World group: holds all tiles; we apply pan/zoom transform here.
     worldG = document.createElementNS(SVG_NS, "g");
     worldG.setAttribute("class", "world");
     svg.appendChild(worldG);
@@ -1057,14 +1016,6 @@
       makeMagic(magicTile);
       worldG.appendChild(magicTile.group); // keep on top
     }
-
-    mstLayer = document.createElementNS(SVG_NS, "g");
-    mstLayer.setAttribute("class", "mst-layer");
-    mstLayer.setAttribute("stroke", BAND_EDGE);
-    mstLayer.setAttribute("stroke-width", "1");
-    mstLayer.setAttribute("stroke-opacity", "0.3");
-    mstLayer.style.pointerEvents = "none";
-    worldG.appendChild(mstLayer);
 
     applyZoomTransform();
     colorize();
