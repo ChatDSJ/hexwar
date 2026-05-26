@@ -36,9 +36,10 @@
   body.searching .color-nodes .node-dot {
     animation: magic-node-radial var(--magic-anim-duration, 3000ms) ease-in-out 1 both;
   }
+  /* Rotations animate at a constant angular velocity of 60° per 450ms (= 7.5ms/deg).
+     Duration is set per-rotation in JS via setRotateAnim() so that a 120° rotation
+     takes 900ms, a 300° rotation takes 2250ms, etc. (David, 2026-05-26) */
   .tile-inner { transition: transform 450ms cubic-bezier(.22,.61,.36,1); transform-origin: 0 0; will-change: transform; }
-  /* During optimization, rotations are 3x slower (David, 2026-05-26). */
-  body.searching .tile-inner { transition: transform 1350ms cubic-bezier(.22,.61,.36,1); }
   .tile { cursor: pointer; }
   .tile:hover .hex-outline { stroke: rgba(58,54,46,0.42); }
   .hex-outline { transition: stroke 200ms ease; }
@@ -52,7 +53,7 @@
 <div id="mode-banner"></div>
 <script>
 (() => {
-  const APP_VERSION = "v13c-slow-rotate-during-opt-2026-05-26-0902";
+  const APP_VERSION = "v14-constant-angular-velocity-2026-05-26-0915";
   console.log("hexwar app version:", APP_VERSION);
   const SVG_NS = "http://www.w3.org/2000/svg";
   const svg = document.getElementById("field");
@@ -296,7 +297,9 @@
           for (let i = 0; i < k; i++) {
             const t = candidates[Math.floor(Math.random() * candidates.length)];
             const steps = 1 + Math.floor(Math.random() * 5);
-            t.rotDeg = t.rotDeg + steps * 60;
+            const deltaDeg = steps * 60;
+            setRotateAnim(t.inner, deltaDeg);
+            t.rotDeg = t.rotDeg + deltaDeg;
             t.inner.style.transform = `rotate(${t.rotDeg}deg)`;
             rotationByCell.set(t.col + "," + t.row, ((t.rotDeg % 360) + 360) % 360);
           }
@@ -326,7 +329,8 @@
           sinceLast = 0;
           // Commit visually: animated transform + apply colors for this state.
           silentColorize = false;
-          for (const [t] of changes) {
+          for (const [t, prev] of changes) {
+            setRotateAnim(t.inner, t.rotDeg - prev);
             t.inner.style.transform = `rotate(${t.rotDeg}deg)`;
             rotationByCell.set(t.col + "," + t.row, ((t.rotDeg % 360) + 360) % 360);
           }
@@ -358,6 +362,7 @@
     for (const t of candidates) {
       const target = everBestRot.get(t);
       if (t.rotDeg !== target) {
+        setRotateAnim(t.inner, target - t.rotDeg);
         t.rotDeg = target;
         t.inner.style.transform = `rotate(${target}deg)`;
         rotationByCell.set(t.col + "," + t.row, ((target % 360) + 360) % 360);
@@ -644,8 +649,19 @@
     }, PULSE_PERIOD_MS);
   }
 
+  // Constant angular-velocity rotation: 60° per 450ms = 7.5 ms/deg.
+  // Set the per-element transition-duration based on the angular delta so
+  // every rotation animates at the same on-screen speed regardless of how
+  // many 60° steps it spans (David, 2026-05-26).
+  const MS_PER_DEG = 450 / 60;
+  function setRotateAnim(inner, deltaDeg) {
+    const dur = Math.max(1, Math.round(Math.abs(deltaDeg) * MS_PER_DEG));
+    inner.style.transitionDuration = dur + "ms";
+  }
+
   // Rotate a single tile by +60° (clockwise on screen).
   function rotateTile(t) {
+    setRotateAnim(t.inner, 60);
     t.rotDeg += 60;
     t.inner.style.transform = `rotate(${t.rotDeg}deg)`;
     rotationByCell.set(t.col + "," + t.row, ((t.rotDeg % 360) + 360) % 360);
