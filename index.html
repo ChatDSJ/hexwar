@@ -48,6 +48,12 @@
   .tile:hover .hex-outline { stroke: rgba(58,54,46,0.42); }
   .hex-outline { transition: stroke 200ms ease; }
   .ribbon { transition: fill 420ms ease; }
+  /* While an optimization is running, the colored ribbons fade back to BAND_FILL
+     over 500ms to match the pulse halt-ramp duration (David, 2026-05-26). */
+  body.searching .ribbon { transition: fill 500ms ease; }
+  /* During the post-optimization color-flow sweep, ribbons snap quickly so the
+     wavefront reads as discrete arcs lighting up (David, 2026-05-26). */
+  body.color-flowing .ribbon { transition: fill 60ms linear; }
   .node-dot { transition: fill 420ms ease; }
   #mode-banner { display: none; }
 </style>
@@ -57,7 +63,7 @@
 <div id="mode-banner"></div>
 <script>
 (() => {
-  const APP_VERSION = "v17-perf-cleanup-2026-05-26-1140";
+  const APP_VERSION = "v18-color-flow-2026-05-26-1210";
   console.log("hexwar app version:", APP_VERSION);
   const SVG_NS = "http://www.w3.org/2000/svg";
   const svg = document.getElementById("field");
@@ -272,15 +278,26 @@
     // the optimization window only (not the halt/resume) so the magic-node
     // animation still lands at translate(0,0) exactly when the search ends.
     pulsesHalted = true;
+    // Cancel any in-flight color-flow timeouts from a previous search so they
+    // don't re-color arcs that are about to fade to gray.
+    cancelColorFlow();
+    // Add `searching` class immediately so `body.searching .ribbon` uses the
+    // 500ms fade-to-gray transition during the halt ramp (David, 2026-05-26).
+    document.body.classList.add("searching");
+    fadeRibbonsToGray();
     await rampPulseSpeed(1, 0, 500);
 
     // Bind the radial-slide animation duration to the actual search duration so
     // dots reach the edge at the midpoint and return home as the search ends.
     document.body.style.setProperty("--magic-anim-duration", durationMs + "ms");
-    document.body.classList.add("searching"); // triggers magic-node-radial CSS
+    // (`searching` class already added above to drive ribbon fade.)
     const mode = MODES[modeIdx];
     const candidates = [];
     for (const t of tiles.values()) if (!t.isMagic) candidates.push(t);
+    // Enter silent-colorize mode BEFORE the first colorize call so the
+    // fade-to-gray we just kicked off isn't immediately undone by writes from
+    // colorize() (David, 2026-05-26).
+    silentColorize = true;
     // Make sure lastColorize reflects current rotDeg before we score.
     colorize();
     let currentScore = mode.score();
@@ -299,14 +316,17 @@
     const STAGNATION = 180;            // trials without improvement → perturb
     const PERTURB_MIN = 6, PERTURB_MAX = 14;
 
-    silentColorize = true;
+    // silentColorize was set above (before the pre-loop colorize). Loop is
+    // entered already in silent mode; it stays true through everBest restore
+    // and is flipped back to false just before the color-flow sweep below.
     try {
-      while (performance.now() < deadline) {
+    while (performance.now() < deadline) {
         // ----- BIG PERTURBATION (always accepted) -----
         if (sinceLast >= STAGNATION) {
           const k = PERTURB_MIN + Math.floor(Math.random() * (PERTURB_MAX - PERTURB_MIN + 1));
-          // Commit perturbation visually so DOM stays in sync with logical state.
-          silentColorize = false;
+          // Commit perturbation: animate tile rotations visibly, but colorize
+          // stays silent — ribbons remain gray for the entire search window so
+          // the only visible "thinking" cue is rotating tiles (David, 2026-05-26).
           for (let i = 0; i < k; i++) {
             const t = candidates[Math.floor(Math.random() * candidates.length)];
             const steps = 1 + Math.floor(Math.random() * 5);
@@ -316,8 +336,7 @@
             t.inner.style.transform = `rotate(${t.rotDeg}deg)`;
             rotationByCell.set(t.col + "," + t.row, ((t.rotDeg % 360) + 360) % 360);
           }
-          colorize();
-          silentColorize = true;
+          colorize(); // silent: updates lastColorize only
           currentScore = mode.score();
           perturbations++;
           sinceLast = 0;
@@ -340,15 +359,13 @@
         if (s > currentScore) {
           currentScore = s;
           sinceLast = 0;
-          // Commit visually: animated transform + apply colors for this state.
-          silentColorize = false;
+          // Commit visually: animated transform only. Colorize stays silent so
+          // ribbons remain gray for the entire search window (David, 2026-05-26).
           for (const [t, prev] of changes) {
             setRotateAnim(t.inner, t.rotDeg - prev);
             t.inner.style.transform = `rotate(${t.rotDeg}deg)`;
             rotationByCell.set(t.col + "," + t.row, ((t.rotDeg % 360) + 360) % 360);
           }
-          colorize();
-          silentColorize = true;
           if (s > everBest) {
             everBest = s;
             improvements++;
@@ -366,9 +383,17 @@
         iters++;
         if (iters % 5 === 0) await new Promise(r => setTimeout(r, 0));
       }
-    } finally {
+    } catch (err) {
+      // Safety: any unexpected throw inside the loop must not leave the page
+      // wedged with silentColorize=true (which would suppress every future
+      // ribbon fill update) or pulses halted forever. Reset both, then rethrow.
       silentColorize = false;
+      pulsesHalted = false;
+      document.body.classList.remove("searching");
+      searching = false;
+      throw err;
     }
+    // Note: silentColorize stays true here intentionally — see comment above.
 
     // Restore everBest configuration if we're not already there (animated).
     let restored = 0;
@@ -382,18 +407,31 @@
         restored++;
       }
     }
+    // Final silent colorize: refreshes `lastColorize.strands` to match the
+    // restored everBest rotations without writing any ribbon fills.
     colorize();
+
+    // Wait for any still-animating tile rotations (including the everBest
+    // restore animation which can be up to 300°=2250ms at constant angular
+    // velocity) to fully land before starting the color-flow sweep + pulse
+    // resume (David, 2026-05-26).
+    const settleWait = Math.max(0, lastRotateEndAt - performance.now());
+    if (settleWait > 0) await new Promise(r => setTimeout(r, settleWait));
 
     // The radial-slide keyframes finish at translate(0,0) right as the
     // animation duration elapses (matched to durationMs), so removing the
     // `searching` class drops cleanly back to the resting state — no jump.
+    // Remove it now (BEFORE starting the color-flow) so the body.searching
+    // ribbon-transition override (500ms) doesn't fight the color-flowing
+    // override (60ms).
     document.body.classList.remove("searching");
+    silentColorize = false;
 
-    // Wait for any still-animating tile rotations (including the everBest
-    // restore animation which can be up to 300°=2250ms at constant angular
-    // velocity) to fully land before resuming pulse motion (David, 2026-05-26).
-    const settleWait = Math.max(0, lastRotateEndAt - performance.now());
-    if (settleWait > 0) await new Promise(r => setTimeout(r, settleWait));
+    // Color-flow sweep (David, 2026-05-26): color flows outward from each
+    // color node along its strand at one hex-length per 5ms. Pulses keep
+    // their colors (untouched). Fire-and-forget — runs in parallel with the
+    // pulse resume ramp.
+    runColorFlow();
 
     // Resume phase: pulses accelerate back to full speed over 500ms; emission
     // resumes immediately (new pulses share `pulseSpeedScale` so they ramp up
@@ -803,6 +841,75 @@
       }
     }
     lastColorize = { strands, nodeColors };
+  }
+
+  // ---------- Optimization-window ribbon animations ----------
+  // David, 2026-05-26:
+  //   • When an optimization starts, the ribbon paths (NOT the pulses) fade
+  //     to gray (BAND_FILL). The fade uses the body.searching .ribbon CSS
+  //     transition (500ms ease), matched to the pulse-halt ramp duration.
+  //   • When the optimization finishes, color flows outward from each color
+  //     node along its strand at one hex-length per 5ms. Pulses are untouched.
+  //
+  // Both phases reference `lastColorize.strands` (the last computed strand
+  // topology) so we only touch arcs that are actually colored.
+
+  const HEX_FLOW_MS = 5; // milliseconds per hex length for the outward flow
+  let colorFlowTimers = [];
+
+  function cancelColorFlow() {
+    for (const id of colorFlowTimers) clearTimeout(id);
+    colorFlowTimers = [];
+    document.body.classList.remove("color-flowing");
+  }
+
+  function fadeRibbonsToGray() {
+    // Reset every currently-colored ribbon arc to BAND_FILL. The CSS rule
+    // `body.searching .ribbon { transition: fill 500ms ease; }` smoothly
+    // animates the fade. We iterate `lastColorize.strands` (cheap — only
+    // colored arcs) instead of scanning every tile.
+    if (!lastColorize) return;
+    for (const strand of lastColorize.strands) {
+      for (const a of strand.arcs) {
+        const el = a.tile.arcs[a.arcName];
+        if (el.getAttribute("fill") !== BAND_FILL) el.setAttribute("fill", BAND_FILL);
+      }
+    }
+  }
+
+  function runColorFlow() {
+    cancelColorFlow();
+    if (!lastColorize) return;
+    const magicTile = magicKey ? tiles.get(magicKey) : null;
+    document.body.classList.add("color-flowing");
+    // Snap the magic-tile color-node dots to the new strand colors first —
+    // they're the source of each strand's outward flow. (The .node-dot 420ms
+    // fill transition gives a soft fade.)
+    if (magicTile) {
+      for (let s = 0; s < 6; s++) {
+        const dot = magicTile.colorNodes[s];
+        const col = lastColorize.nodeColors[s] || "#ffffff";
+        if (dot.getAttribute("fill") !== col) dot.setAttribute("fill", col);
+      }
+    }
+    let maxDelay = 0;
+    for (const strand of lastColorize.strands) {
+      strand.arcs.forEach((a, i) => {
+        const delay = (i + 1) * HEX_FLOW_MS;
+        if (delay > maxDelay) maxDelay = delay;
+        const id = setTimeout(() => {
+          a.tile.arcs[a.arcName].setAttribute("fill", strand.color);
+        }, delay);
+        colorFlowTimers.push(id);
+      });
+    }
+    // After the last arc fills + a fade tail, drop the color-flowing class so
+    // future arc fills (e.g. click→rotateTile→colorize) use the default 420ms
+    // .ribbon transition again.
+    const tailMs = Math.max(120, maxDelay + 120);
+    colorFlowTimers.push(setTimeout(() => {
+      document.body.classList.remove("color-flowing");
+    }, tailMs));
   }
 
   // ---------- Optimization modes ----------
