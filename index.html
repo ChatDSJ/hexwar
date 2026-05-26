@@ -53,7 +53,7 @@
 <div id="mode-banner"></div>
 <script>
 (() => {
-  const APP_VERSION = "v15-pulse-halt-resume-2026-05-26-0945";
+  const APP_VERSION = "v16-wait-for-rotations-2026-05-26-1030";
   console.log("hexwar app version:", APP_VERSION);
   const SVG_NS = "http://www.w3.org/2000/svg";
   const svg = document.getElementById("field");
@@ -385,6 +385,12 @@
     // `searching` class drops cleanly back to the resting state — no jump.
     document.body.classList.remove("searching");
 
+    // Wait for any still-animating tile rotations (including the everBest
+    // restore animation which can be up to 300°=2250ms at constant angular
+    // velocity) to fully land before resuming pulse motion (David, 2026-05-26).
+    const settleWait = Math.max(0, lastRotateEndAt - performance.now());
+    if (settleWait > 0) await new Promise(r => setTimeout(r, settleWait));
+
     // Resume phase: pulses accelerate back to full speed over 500ms; emission
     // resumes immediately (new pulses share `pulseSpeedScale` so they ramp up
     // alongside the survivors).
@@ -691,9 +697,15 @@
   // every rotation animates at the same on-screen speed regardless of how
   // many 60° steps it spans (David, 2026-05-26).
   const MS_PER_DEG = 450 / 60;
+  // Track the latest performance.now() at which any in-flight tile rotation
+  // will land. The search resume-phase waits for this to elapse so pulses don't
+  // start moving on top of still-rotating tiles (David, 2026-05-26).
+  let lastRotateEndAt = 0;
   function setRotateAnim(inner, deltaDeg) {
     const dur = Math.max(1, Math.round(Math.abs(deltaDeg) * MS_PER_DEG));
     inner.style.transitionDuration = dur + "ms";
+    const endAt = performance.now() + dur;
+    if (endAt > lastRotateEndAt) lastRotateEndAt = endAt;
   }
 
   // Rotate a single tile by +60° (clockwise on screen).
