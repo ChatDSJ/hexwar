@@ -63,7 +63,7 @@
 <div id="mode-banner"></div>
 <script>
 (() => {
-  const APP_VERSION = "v20-shortest-path-rotations-2026-05-27-1145";
+  const APP_VERSION = "v21-display-tracks-everbest-2026-05-27-1205";
   console.log("hexwar app version:", APP_VERSION);
   const SVG_NS = "http://www.w3.org/2000/svg";
   const svg = document.getElementById("field");
@@ -310,6 +310,16 @@
     const everBestRot = new Map();
     for (const t of candidates) everBestRot.set(t, t.rotDeg);
 
+    // What rotation each candidate tile is CURRENTLY DISPLAYING on screen.
+    // The display now tracks `everBest` only — accepted trials and big
+    // perturbations are logical-only (silent in BOTH `t.inner.style.transform`
+    // and `colorize()`), and we animate only the diff between `displayedRot`
+    // and the new `everBestRot` whenever a new global high is reached
+    // (David, 2026-05-27, v21). Keeps the screen showing the current global
+    // best the whole time and eliminates the post-loop everBest restore step.
+    const displayedRot = new Map();
+    for (const t of candidates) displayedRot.set(t, t.rotDeg);
+
     updateModeBanner(modeIdx, currentScore, "searching…");
     const deadline = performance.now() + durationMs;
     let iters = 0, improvements = 0, perturbations = 0, sinceLast = 0;
@@ -321,26 +331,18 @@
     // and is flipped back to false just before the color-flow sweep below.
     try {
     while (performance.now() < deadline) {
-        // ----- BIG PERTURBATION (always accepted) -----
+        // ----- BIG PERTURBATION (always accepted, LOGICAL ONLY) -----
         if (sinceLast >= STAGNATION) {
           const k = PERTURB_MIN + Math.floor(Math.random() * (PERTURB_MAX - PERTURB_MIN + 1));
-          // Commit perturbation: animate tile rotations visibly, but colorize
-          // stays silent — ribbons remain gray for the entire search window so
-          // the only visible "thinking" cue is rotating tiles (David, 2026-05-26).
+          // v21: perturbation is logical-only. The DOM keeps showing
+          // `everBest`; we don't animate tiles into a worse basin we'll just
+          // climb away from. If hill-climbing in this perturbed basin finds a
+          // new global high, the everBest-diff animation below will commit
+          // exactly the tiles that actually changed since the prior everBest.
           for (let i = 0; i < k; i++) {
             const t = candidates[Math.floor(Math.random() * candidates.length)];
             const steps = 1 + Math.floor(Math.random() * 5);
-            const rawDeltaDeg = steps * 60;
-            // Animate via the shortest signed-equivalent rotation in
-            // (-180°, +180°]. Visual orientation is mod 360°, so this maps
-            // {60,120,180,240,300} → {60,120,180,-120,-60}. Caps each tile
-            // animation at 180°×MS_PER_DEG = 1350ms instead of up to 2250ms,
-            // which keeps the tail of the search loop from blowing settleWait.
-            const deltaDeg = ((rawDeltaDeg % 360) + 540) % 360 - 180;
-            setRotateAnim(t.inner, deltaDeg);
-            t.rotDeg = t.rotDeg + deltaDeg;
-            t.inner.style.transform = `rotate(${t.rotDeg}deg)`;
-            rotationByCell.set(t.col + "," + t.row, ((t.rotDeg % 360) + 360) % 360);
+            t.rotDeg = t.rotDeg + steps * 60;
           }
           colorize(); // silent: updates lastColorize only
           currentScore = mode.score();
@@ -363,27 +365,37 @@
         colorize(); // silent: only computes lastColorize
         const s = mode.score();
         if (s > currentScore) {
+          // v21: accepted trial is logical-only. DOM still shows everBest.
           currentScore = s;
           sinceLast = 0;
-          // Commit visually: animated transform only. Colorize stays silent so
-          // ribbons remain gray for the entire search window (David, 2026-05-26).
-          // Animate via the shortest signed-equivalent rotation in (-180°,+180°]
-          // — same rationale as the perturbation block above. Update t.rotDeg
-          // to the normalized value to keep it bounded across iterations and so
-          // the everBest snapshot (taken right below) carries the same bounded
-          // value, which in turn keeps the final restore delta bounded too.
-          for (const [t, prev] of changes) {
-            const rawDelta = t.rotDeg - prev;
-            const delta = ((rawDelta % 360) + 540) % 360 - 180;
-            setRotateAnim(t.inner, delta);
-            t.rotDeg = prev + delta;
-            t.inner.style.transform = `rotate(${t.rotDeg}deg)`;
-            rotationByCell.set(t.col + "," + t.row, ((t.rotDeg % 360) + 360) % 360);
-          }
           if (s > everBest) {
+            // New global high — snapshot then animate the diff between the
+            // currently-displayed config and the new everBest config. Only
+            // tiles whose displayed orientation differs from the new target
+            // get a rotation animation; everything else stays put.
             everBest = s;
             improvements++;
             for (const t of candidates) everBestRot.set(t, t.rotDeg);
+            for (const t of candidates) {
+              const target = t.rotDeg;
+              const shown = displayedRot.get(t);
+              if (shown === target) continue;
+              // Shortest signed-equivalent rotation in (-180°, +180°]. Caps
+              // each animation at 180°×MS_PER_DEG = 1350ms and keeps the
+              // displayed value bounded across the search.
+              const rawDelta = target - shown;
+              const delta = ((rawDelta % 360) + 540) % 360 - 180;
+              if (delta === 0) {
+                // Differs by an exact multiple of 360° — visually identical.
+                displayedRot.set(t, target);
+                continue;
+              }
+              setRotateAnim(t.inner, delta);
+              const newShown = shown + delta;
+              t.inner.style.transform = `rotate(${newShown}deg)`;
+              displayedRot.set(t, newShown);
+              rotationByCell.set(t.col + "," + t.row, ((newShown % 360) + 360) % 360);
+            }
             updateModeBanner(modeIdx, everBest, "searching…");
           }
         } else {
@@ -409,43 +421,37 @@
     }
     // Note: silentColorize stays true here intentionally — see comment above.
 
-    // Restore everBest configuration if we're not already there (animated).
-    // The raw delta `target - t.rotDeg` would be the unbounded-degree delta:
-    // `t.rotDeg` accumulates monotonically through the hill climb (every
-    // accepted trial / perturbation ADDS to it), so after the last `everBest`
-    // snapshot drifted, the raw restore delta can exceed ±360° — meaning the
-    // tile would visually spin MORE than one full revolution to settle into
-    // its best rotation. Empirically observed deltas up to -480° → 3600ms of
-    // settleWait per cycle (David, 2026-05-27).
-    //
-    // Since the tile's visual orientation is mod 360°, we route via the
-    // shortest signed-equivalent rotation in (-180°, +180°]. That caps the
-    // restore animation at 180°×MS_PER_DEG = 1350ms and keeps `t.rotDeg`
-    // bounded across cycles. Visually the end state is identical (the new
-    // CSS transform absolute value differs from `target` by a multiple of
-    // 360°, but rotate(X) ≡ rotate(X mod 360°)).
+    // v21: the DOM has been showing the current everBest configuration
+    // throughout the search (display only updates on new everBest), so this
+    // step is normally a no-op. We still sync logical `t.rotDeg` to
+    // `everBestRot[t]` (which equals what's displayed mod 360°) so future
+    // searches start from a clean basin, and we keep an animated fallback
+    // in case anything drifted. Expected: `restored = 0` every run.
     let restored = 0;
     for (const t of candidates) {
       const target = everBestRot.get(t);
-      if (t.rotDeg !== target) {
-        const rawDelta = target - t.rotDeg;
+      const shown = displayedRot.get(t);
+      // Bring logical state back in line with the everBest snapshot.
+      t.rotDeg = target;
+      // Visual check: shown should already equal target mod 360°. Animate
+      // any residual diff as a safety net.
+      if (shown !== target) {
+        const rawDelta = target - shown;
         const delta = ((rawDelta % 360) + 540) % 360 - 180;
         if (delta === 0) {
-          // raw differs from target by an exact multiple of 360° → already in
-          // the right visual state, nothing to animate. Sync the numeric
-          // bookkeeping to keep `t.rotDeg` from drifting unboundedly.
-          t.rotDeg = target;
+          displayedRot.set(t, target);
           continue;
         }
         setRotateAnim(t.inner, delta);
-        t.rotDeg = t.rotDeg + delta;
-        t.inner.style.transform = `rotate(${t.rotDeg}deg)`;
-        rotationByCell.set(t.col + "," + t.row, ((t.rotDeg % 360) + 360) % 360);
+        const newShown = shown + delta;
+        t.inner.style.transform = `rotate(${newShown}deg)`;
+        displayedRot.set(t, newShown);
+        rotationByCell.set(t.col + "," + t.row, ((newShown % 360) + 360) % 360);
         restored++;
       }
     }
     // Final silent colorize: refreshes `lastColorize.strands` to match the
-    // restored everBest rotations without writing any ribbon fills.
+    // everBest rotations without writing any ribbon fills.
     colorize();
 
     // Wait for any still-animating tile rotations (including the everBest
