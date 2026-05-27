@@ -63,7 +63,7 @@
 <div id="mode-banner"></div>
 <script>
 (() => {
-  const APP_VERSION = "v18-color-flow-2026-05-26-1210";
+  const APP_VERSION = "v19-restore-mod360-2026-05-27-1035";
   console.log("hexwar app version:", APP_VERSION);
   const SVG_NS = "http://www.w3.org/2000/svg";
   const svg = document.getElementById("field");
@@ -396,14 +396,37 @@
     // Note: silentColorize stays true here intentionally — see comment above.
 
     // Restore everBest configuration if we're not already there (animated).
+    // The raw delta `target - t.rotDeg` would be the unbounded-degree delta:
+    // `t.rotDeg` accumulates monotonically through the hill climb (every
+    // accepted trial / perturbation ADDS to it), so after the last `everBest`
+    // snapshot drifted, the raw restore delta can exceed ±360° — meaning the
+    // tile would visually spin MORE than one full revolution to settle into
+    // its best rotation. Empirically observed deltas up to -480° → 3600ms of
+    // settleWait per cycle (David, 2026-05-27).
+    //
+    // Since the tile's visual orientation is mod 360°, we route via the
+    // shortest signed-equivalent rotation in (-180°, +180°]. That caps the
+    // restore animation at 180°×MS_PER_DEG = 1350ms and keeps `t.rotDeg`
+    // bounded across cycles. Visually the end state is identical (the new
+    // CSS transform absolute value differs from `target` by a multiple of
+    // 360°, but rotate(X) ≡ rotate(X mod 360°)).
     let restored = 0;
     for (const t of candidates) {
       const target = everBestRot.get(t);
       if (t.rotDeg !== target) {
-        setRotateAnim(t.inner, target - t.rotDeg);
-        t.rotDeg = target;
-        t.inner.style.transform = `rotate(${target}deg)`;
-        rotationByCell.set(t.col + "," + t.row, ((target % 360) + 360) % 360);
+        const rawDelta = target - t.rotDeg;
+        const delta = ((rawDelta % 360) + 540) % 360 - 180;
+        if (delta === 0) {
+          // raw differs from target by an exact multiple of 360° → already in
+          // the right visual state, nothing to animate. Sync the numeric
+          // bookkeeping to keep `t.rotDeg` from drifting unboundedly.
+          t.rotDeg = target;
+          continue;
+        }
+        setRotateAnim(t.inner, delta);
+        t.rotDeg = t.rotDeg + delta;
+        t.inner.style.transform = `rotate(${t.rotDeg}deg)`;
+        rotationByCell.set(t.col + "," + t.row, ((t.rotDeg % 360) + 360) % 360);
         restored++;
       }
     }
