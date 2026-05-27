@@ -63,7 +63,7 @@
 <div id="mode-banner"></div>
 <script>
 (() => {
-  const APP_VERSION = "v21-display-tracks-everbest-2026-05-27-1205";
+  const APP_VERSION = "v22-constant-velocity-on-rearm-2026-05-27-1225";
   console.log("hexwar app version:", APP_VERSION);
   const SVG_NS = "http://www.w3.org/2000/svg";
   const svg = document.getElementById("field");
@@ -369,29 +369,69 @@
           currentScore = s;
           sinceLast = 0;
           if (s > everBest) {
-            // New global high — snapshot then animate the diff between the
+            // New global high — snapshot, then animate the diff between the
             // currently-displayed config and the new everBest config. Only
             // tiles whose displayed orientation differs from the new target
             // get a rotation animation; everything else stays put.
             everBest = s;
             improvements++;
             for (const t of candidates) everBestRot.set(t, t.rotDeg);
+
+            // v22 (David, 2026-05-27): re-arming a tile that's still
+            // mid-rotation from a prior everBest must preserve the *constant
+            // on-screen angular velocity* (60°/450ms = 7.5 ms/deg). If we just
+            // overwrote `transform` with a new target, CSS would interpolate
+            // from the live visually-interpolated angle to the new target over
+            // the duration we requested — but the duration is computed from
+            // the snap-to-snap delta, not the live-visual-to-target delta, so
+            // any in-flight tile would speed up. Fix: for each in-flight tile,
+            // read its live visual angle, snap `transform` to that value with
+            // `transitionDuration: 0`, force a single batched reflow, THEN
+            // arm the new transition + write the new target. This guarantees
+            // every rotation animates at exactly MS_PER_DEG ms/deg.
+            const now2 = performance.now();
+            const startAngle = new Map(); // tile → angle to animate FROM
+            let anyInFlight = false;
             for (const t of candidates) {
               const target = t.rotDeg;
               const shown = displayedRot.get(t);
               if (shown === target) continue;
-              // Shortest signed-equivalent rotation in (-180°, +180°]. Caps
-              // each animation at 180°×MS_PER_DEG = 1350ms and keeps the
-              // displayed value bounded across the search.
-              const rawDelta = target - shown;
+              if (t.inner.__rotEndAt && t.inner.__rotEndAt > now2) {
+                // Live read of current interpolated angle (mod 360°).
+                startAngle.set(t, readVisualAngle(t.inner));
+                anyInFlight = true;
+              } else {
+                startAngle.set(t, shown);
+              }
+            }
+            // Snap pass for in-flight tiles: zero out the transition and write
+            // the current visual angle so the next style change starts from
+            // exactly where the eye is.
+            if (anyInFlight) {
+              for (const [t, va] of startAngle) {
+                if (t.inner.__rotEndAt && t.inner.__rotEndAt > now2) {
+                  t.inner.style.transitionDuration = "0ms";
+                  t.inner.style.transform = `rotate(${va}deg)`;
+                }
+              }
+              // Single batched reflow so the snap is realized before we arm
+              // the new transition.
+              document.body.getBoundingClientRect();
+            }
+            // Arm pass: shortest signed-equivalent rotation in (-180°,+180°].
+            // Duration = |delta| × MS_PER_DEG → constant 7.5 ms/deg.
+            for (const [t, start] of startAngle) {
+              const target = t.rotDeg;
+              const rawDelta = target - start;
               const delta = ((rawDelta % 360) + 540) % 360 - 180;
               if (delta === 0) {
-                // Differs by an exact multiple of 360° — visually identical.
+                // Differs from start by an exact multiple of 360° → visually
+                // identical, no animation needed.
                 displayedRot.set(t, target);
                 continue;
               }
               setRotateAnim(t.inner, delta);
-              const newShown = shown + delta;
+              const newShown = start + delta;
               t.inner.style.transform = `rotate(${newShown}deg)`;
               displayedRot.set(t, newShown);
               rotationByCell.set(t.col + "," + t.row, ((newShown % 360) + 360) % 360);
@@ -738,7 +778,23 @@
       inner.addEventListener("transitioncancel", inner.__rotCleanup);
     }
     const endAt = performance.now() + dur;
+    inner.__rotEndAt = endAt;
     if (endAt > lastRotateEndAt) lastRotateEndAt = endAt;
+  }
+
+  // Read the LIVE interpolated rotation angle of an inner-g, in degrees, in
+  // (-180°, +180°]. Resolves the current computed-style transform matrix and
+  // extracts the rotation via atan2(b, a). Used when re-arming a still-in-flight
+  // rotation so the new animation starts from the actual visual state, giving
+  // constant on-screen angular velocity even when targets change mid-flight
+  // (David, 2026-05-27, v22). NOTE: triggers a style read; caller should batch.
+  function readVisualAngle(inner) {
+    const tr = getComputedStyle(inner).transform;
+    if (!tr || tr === "none") return 0;
+    const m = tr.match(/matrix\(([^)]+)\)/);
+    if (!m) return 0;
+    const parts = m[1].split(",").map(parseFloat);
+    return Math.atan2(parts[1], parts[0]) * 180 / Math.PI;
   }
 
   // Rotate a single tile by +60° (clockwise on screen).
