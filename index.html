@@ -63,7 +63,7 @@
 <div id="mode-banner"></div>
 <script>
 (() => {
-  const APP_VERSION = "v19-restore-mod360-2026-05-27-1035";
+  const APP_VERSION = "v20-shortest-path-rotations-2026-05-27-1145";
   console.log("hexwar app version:", APP_VERSION);
   const SVG_NS = "http://www.w3.org/2000/svg";
   const svg = document.getElementById("field");
@@ -330,7 +330,13 @@
           for (let i = 0; i < k; i++) {
             const t = candidates[Math.floor(Math.random() * candidates.length)];
             const steps = 1 + Math.floor(Math.random() * 5);
-            const deltaDeg = steps * 60;
+            const rawDeltaDeg = steps * 60;
+            // Animate via the shortest signed-equivalent rotation in
+            // (-180°, +180°]. Visual orientation is mod 360°, so this maps
+            // {60,120,180,240,300} → {60,120,180,-120,-60}. Caps each tile
+            // animation at 180°×MS_PER_DEG = 1350ms instead of up to 2250ms,
+            // which keeps the tail of the search loop from blowing settleWait.
+            const deltaDeg = ((rawDeltaDeg % 360) + 540) % 360 - 180;
             setRotateAnim(t.inner, deltaDeg);
             t.rotDeg = t.rotDeg + deltaDeg;
             t.inner.style.transform = `rotate(${t.rotDeg}deg)`;
@@ -361,8 +367,16 @@
           sinceLast = 0;
           // Commit visually: animated transform only. Colorize stays silent so
           // ribbons remain gray for the entire search window (David, 2026-05-26).
+          // Animate via the shortest signed-equivalent rotation in (-180°,+180°]
+          // — same rationale as the perturbation block above. Update t.rotDeg
+          // to the normalized value to keep it bounded across iterations and so
+          // the everBest snapshot (taken right below) carries the same bounded
+          // value, which in turn keeps the final restore delta bounded too.
           for (const [t, prev] of changes) {
-            setRotateAnim(t.inner, t.rotDeg - prev);
+            const rawDelta = t.rotDeg - prev;
+            const delta = ((rawDelta % 360) + 540) % 360 - 180;
+            setRotateAnim(t.inner, delta);
+            t.rotDeg = prev + delta;
             t.inner.style.transform = `rotate(${t.rotDeg}deg)`;
             rotationByCell.set(t.col + "," + t.row, ((t.rotDeg % 360) + 360) % 360);
           }
