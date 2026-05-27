@@ -27,7 +27,7 @@
   }
   @keyframes color-nodes-spin {
     from { transform: rotate(0deg); }
-    to   { transform: rotate(360deg); }
+    to   { transform: rotate(60deg); }
   }
   body.search-phase-spin .color-nodes {
     animation: color-nodes-spin var(--search-duration, 1000ms) linear 1 both;
@@ -67,11 +67,12 @@
   .tile:hover .hex-outline { stroke: rgba(58,54,46,0.42); }
   .hex-outline { transition: stroke 200ms ease; }
   .ribbon { transition: fill 420ms ease; }
-  /* Ribbons fade to gray for all three search phases (David, 2026-05-27, v23). */
-  body.search-phase-out .ribbon,
-  body.search-phase-spin .ribbon,
-  body.search-phase-in   .ribbon {
-    transition: fill 250ms ease;
+  /* Ribbons fade to gray during phase B (the optimization), stretched over the
+     full search duration. Phase A and Phase C use the default .ribbon transition;
+     fills are only written at the start of phase B and at phase D (color-flow).
+     David, 2026-05-27, v24. */
+  body.search-phase-spin .ribbon {
+    transition: fill var(--search-duration, 1000ms) ease;
   }
   /* During the post-optimization color-flow sweep, ribbons snap quickly so the
      wavefront reads as discrete arcs lighting up (David, 2026-05-26). */
@@ -85,7 +86,7 @@
 <div id="mode-banner"></div>
 <script>
 (() => {
-  const APP_VERSION = "v23-staged-spin-then-rotate-2026-05-27-1230";
+  const APP_VERSION = "v24-60deg-spin-ribbons-fade-during-opt-2026-05-27-1300";
   console.log("hexwar app version:", APP_VERSION);
   const SVG_NS = "http://www.w3.org/2000/svg";
   const svg = document.getElementById("field");
@@ -323,10 +324,11 @@
     const preSearchRot = new Map();
     for (const t of candidates) preSearchRot.set(t, t.rotDeg);
 
-    // Drive the ribbon fade-to-gray + node move-out + node-fill-to-gray.
+    // Drive node move-out + node-fill-to-gray. Ribbons are NOT touched yet —
+    // they fade to gray during phase B (David, 2026-05-27, v24). silentColorize
+    // is true so the lastColorize() call below won't repaint them.
     document.body.style.setProperty("--phase-out-duration", PHASE_OUT_MS + "ms");
     document.body.classList.add("search-phase-out");
-    fadeRibbonsToGray();
     // Also fade the inline `fill` attribute on each color-node dot toward gray.
     // The CSS rule above already overrides the rendered color to BAND during
     // phases A-C, but writing the inline value to BAND now means that when the
@@ -359,6 +361,10 @@
     document.body.style.setProperty("--search-duration", durationMs + "ms");
     document.body.classList.remove("search-phase-out");
     document.body.classList.add("search-phase-spin");
+    // Now fade the ribbons to gray over the full search duration — the
+    // search-phase-spin .ribbon transition above stretches the fade across
+    // the optimization window (David, 2026-05-27, v24).
+    fadeRibbonsToGray();
 
     const deadline = performance.now() + durationMs;
     let iters = 0, improvements = 0, perturbations = 0, sinceLast = 0;
