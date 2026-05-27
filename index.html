@@ -16,25 +16,44 @@
   body { font-family: system-ui, sans-serif; -webkit-tap-highlight-color: transparent; }
   svg#field { display: block; width: 100vw; height: 100vh; cursor: pointer; touch-action: none; user-select: none; -webkit-user-select: none; }
   .drag-rect { pointer-events: none; }
-  /* (search runs in logical state; transitions stay on so improvements animate) */
-  /* During optimization, each color node slides radially outward so its center
-     ends up on the hex edge midpoint, holds there, then slides back. The
-     translate amount is set per-dot via --out-dx / --out-dy (user-space units)
-     when the magic tile is built. The animation runs once over the full
-     search duration and is split into four equal-length phases:
-       0%  →  25%  : moving outward
-      25%  →  75%  : holding on the hex edge
-      75%  → 100%  : moving back to home. */
-  @keyframes magic-node-radial {
-    0%, 100% { transform: translate(0px, 0px); }
-    25%, 75% { transform: translate(var(--out-dx, 0px), var(--out-dy, 0px)); }
+  /* v23 (David, 2026-05-27): staged optimization animation.
+     PHASE A (out, 250ms)  – nodes slide radially out + fade to gray, ribbons fade gray, pulses ramp to 0.
+     PHASE B (spin, 1000ms) – nodes hold outward & orbit the magic-tile center 360°. NO hex tile rotates.
+     PHASE C (in,  ≤1350ms) – nodes slide back to home (still gray); hex tiles rotate to optimized orientation.
+     PHASE D (flow)         – ribbons color in via runColorFlow; nodes get their new colors. Pulses ramp back. */
+  .color-nodes {
+    /* origin = magic-tile center in this group's local frame */
+    transform-origin: 0px 0px;
+  }
+  @keyframes color-nodes-spin {
+    from { transform: rotate(0deg); }
+    to   { transform: rotate(360deg); }
+  }
+  body.search-phase-spin .color-nodes {
+    animation: color-nodes-spin var(--search-duration, 1000ms) linear 1 both;
   }
   .color-nodes .node-dot {
     transform-box: fill-box;
     transform-origin: center;
   }
-  body.searching .color-nodes .node-dot {
-    animation: magic-node-radial var(--magic-anim-duration, 3000ms) ease-in-out 1 both;
+  /* Phase A: animate translate home→outward and fade to gray. */
+  body.search-phase-out .color-nodes .node-dot {
+    transform: translate(var(--out-dx, 0px), var(--out-dy, 0px));
+    transition: transform var(--phase-out-duration, 250ms) ease-out, fill 250ms ease;
+    fill: var(--band) !important;
+  }
+  /* Phase B: hold outward, stay gray. (Group rotation animates around magic-tile center.) */
+  body.search-phase-spin .color-nodes .node-dot {
+    transform: translate(var(--out-dx, 0px), var(--out-dy, 0px));
+    fill: var(--band) !important;
+  }
+  /* Phase C: animate translate outward→home, still gray. Duration is set per-search
+     in JS to match the longest hex-tile rotation so nodes land at home exactly when
+     all tiles finish rotating. */
+  body.search-phase-in .color-nodes .node-dot {
+    transform: translate(0px, 0px);
+    transition: transform var(--phase-in-duration, 1000ms) ease-in-out, fill 250ms ease;
+    fill: var(--band) !important;
   }
   /* Rotations animate at a constant angular velocity of 60° per 450ms (= 7.5ms/deg).
      Duration is set per-rotation in JS via setRotateAnim() so that a 120° rotation
@@ -48,9 +67,12 @@
   .tile:hover .hex-outline { stroke: rgba(58,54,46,0.42); }
   .hex-outline { transition: stroke 200ms ease; }
   .ribbon { transition: fill 420ms ease; }
-  /* While an optimization is running, the colored ribbons fade back to BAND_FILL
-     over 500ms to match the pulse halt-ramp duration (David, 2026-05-26). */
-  body.searching .ribbon { transition: fill 500ms ease; }
+  /* Ribbons fade to gray for all three search phases (David, 2026-05-27, v23). */
+  body.search-phase-out .ribbon,
+  body.search-phase-spin .ribbon,
+  body.search-phase-in   .ribbon {
+    transition: fill 250ms ease;
+  }
   /* During the post-optimization color-flow sweep, ribbons snap quickly so the
      wavefront reads as discrete arcs lighting up (David, 2026-05-26). */
   body.color-flowing .ribbon { transition: fill 60ms linear; }
@@ -63,7 +85,7 @@
 <div id="mode-banner"></div>
 <script>
 (() => {
-  const APP_VERSION = "v22-constant-velocity-on-rearm-2026-05-27-1225";
+  const APP_VERSION = "v23-staged-spin-then-rotate-2026-05-27-1230";
   console.log("hexwar app version:", APP_VERSION);
   const SVG_NS = "http://www.w3.org/2000/svg";
   const svg = document.getElementById("field");
@@ -267,84 +289,93 @@
   // configuration that maximizes the number of colored ribbon arcs. The live DOM
   // is mutated in-place — accepted improvements stay, rejected trials revert —
   // so the screen always shows the current best-so-far.
+  // v23 (David, 2026-05-27): four-phase staged optimization animation.
+  //   PHASE A (out,  PHASE_OUT_MS): color nodes slide radially outward + go gray,
+  //                                 ribbons fade to gray, pulses ramp 1→0.
+  //   PHASE B (spin, durationMs):   hex tiles DO NOT ROTATE. Color-nodes group spins
+  //                                 360° around the magic-tile center. Hill-climb is
+  //                                 purely logical (no DOM rotation writes anywhere).
+  //   PHASE C (in,   phaseInMs):    color nodes slide back home (still gray); hex tiles
+  //                                 rotate to their optimized orientation in parallel.
+  //                                 Move-in duration is set to the longest tile-rotation
+  //                                 so they finish together.
+  //   PHASE D (flow):               runColorFlow paints ribbons + node colors;
+  //                                 pulses ramp 0→1 over 500ms in parallel.
   let searching = false;
-  async function searchBestConfig(durationMs = 3000, modeIdx = currentMode) {
+  const PHASE_OUT_MS = 250;
+  const PHASE_C_MIN_MS = 350; // floor for phase C even when no tiles need to rotate
+  async function searchBestConfig(durationMs = 1000, modeIdx = currentMode) {
     if (searching) return;
     searching = true;
 
-    // Halt phase (David, 2026-05-26): pulses decelerate to a stop over 500ms,
-    // emission is suspended, THEN the optimization runs. After optimization we
-    // ramp pulses back up over 500ms. The radial-slide CSS class is bound to
-    // the optimization window only (not the halt/resume) so the magic-node
-    // animation still lands at translate(0,0) exactly when the search ends.
-    pulsesHalted = true;
-    // Cancel any in-flight color-flow timeouts from a previous search so they
-    // don't re-color arcs that are about to fade to gray.
     cancelColorFlow();
-    // Add `searching` class immediately so `body.searching .ribbon` uses the
-    // 500ms fade-to-gray transition during the halt ramp (David, 2026-05-26).
-    document.body.classList.add("searching");
-    fadeRibbonsToGray();
-    await rampPulseSpeed(1, 0, 500);
 
-    // Bind the radial-slide animation duration to the actual search duration so
-    // dots reach the edge at the midpoint and return home as the search ends.
-    document.body.style.setProperty("--magic-anim-duration", durationMs + "ms");
-    // (`searching` class already added above to drive ribbon fade.)
+    // ----- PHASE A: nodes out + ribbons gray + pulses halt -----
     const mode = MODES[modeIdx];
     const candidates = [];
     for (const t of tiles.values()) if (!t.isMagic) candidates.push(t);
-    // Enter silent-colorize mode BEFORE the first colorize call so the
-    // fade-to-gray we just kicked off isn't immediately undone by writes from
-    // colorize() (David, 2026-05-26).
-    silentColorize = true;
-    // Make sure lastColorize reflects current rotDeg before we score.
-    colorize();
-    let currentScore = mode.score();
 
-    // Random-restart hill climb with periodic big perturbation to escape local
-    // minima (David, 2026-05-25). everBest tracks the best score seen across all
-    // perturbation basins and we snapshot the rotation of every candidate tile at
-    // each new everBest so we can restore the global optimum at the end.
+    pulsesHalted = true;
+    silentColorize = true;
+    // Pre-search rotation each tile is CURRENTLY DISPLAYING on screen. Because
+    // no DOM rotation happens during phases A or B, this equals `t.rotDeg` at
+    // the moment search starts (the invariant `t.rotDeg == displayed`).
+    const preSearchRot = new Map();
+    for (const t of candidates) preSearchRot.set(t, t.rotDeg);
+
+    // Drive the ribbon fade-to-gray + node move-out + node-fill-to-gray.
+    document.body.style.setProperty("--phase-out-duration", PHASE_OUT_MS + "ms");
+    document.body.classList.add("search-phase-out");
+    fadeRibbonsToGray();
+    // Also fade the inline `fill` attribute on each color-node dot toward gray.
+    // The CSS rule above already overrides the rendered color to BAND during
+    // phases A-C, but writing the inline value to BAND now means that when the
+    // class is later removed (phase D), the .node-dot 420ms transition will
+    // animate gray → new color (instead of snapping past gray straight to the
+    // new color).
+    const magicTile = magicKey ? tiles.get(magicKey) : null;
+    if (magicTile) {
+      for (let s = 0; s < 6; s++) {
+        const dot = magicTile.colorNodes[s];
+        if (dot.getAttribute("fill") !== BAND_FILL) dot.setAttribute("fill", BAND_FILL);
+      }
+    }
+
+    colorize(); // silent: refresh lastColorize so score() is accurate at search start
+    let currentScore = mode.score();
     let everBest = currentScore;
     const everBestRot = new Map();
     for (const t of candidates) everBestRot.set(t, t.rotDeg);
 
-    // What rotation each candidate tile is CURRENTLY DISPLAYING on screen.
-    // The display now tracks `everBest` only — accepted trials and big
-    // perturbations are logical-only (silent in BOTH `t.inner.style.transform`
-    // and `colorize()`), and we animate only the diff between `displayedRot`
-    // and the new `everBestRot` whenever a new global high is reached
-    // (David, 2026-05-27, v21). Keeps the screen showing the current global
-    // best the whole time and eliminates the post-loop everBest restore step.
-    const displayedRot = new Map();
-    for (const t of candidates) displayedRot.set(t, t.rotDeg);
-
     updateModeBanner(modeIdx, currentScore, "searching…");
+
+    // Wait for phase A (250ms) — node-out + gray-fade + pulse halt-ramp run in parallel.
+    await Promise.all([
+      rampPulseSpeed(1, 0, PHASE_OUT_MS),
+      new Promise(r => setTimeout(r, PHASE_OUT_MS)),
+    ]);
+
+    // ----- PHASE B: optimization + color-nodes orbit 360° -----
+    document.body.style.setProperty("--search-duration", durationMs + "ms");
+    document.body.classList.remove("search-phase-out");
+    document.body.classList.add("search-phase-spin");
+
     const deadline = performance.now() + durationMs;
     let iters = 0, improvements = 0, perturbations = 0, sinceLast = 0;
-    const STAGNATION = 180;            // trials without improvement → perturb
+    const STAGNATION = 180;
     const PERTURB_MIN = 6, PERTURB_MAX = 14;
 
-    // silentColorize was set above (before the pre-loop colorize). Loop is
-    // entered already in silent mode; it stays true through everBest restore
-    // and is flipped back to false just before the color-flow sweep below.
     try {
-    while (performance.now() < deadline) {
-        // ----- BIG PERTURBATION (always accepted, LOGICAL ONLY) -----
+      while (performance.now() < deadline) {
+        // BIG PERTURBATION — logical only.
         if (sinceLast >= STAGNATION) {
           const k = PERTURB_MIN + Math.floor(Math.random() * (PERTURB_MAX - PERTURB_MIN + 1));
-          // v21: perturbation is logical-only. The DOM keeps showing
-          // `everBest`; we don't animate tiles into a worse basin we'll just
-          // climb away from. If hill-climbing in this perturbed basin finds a
-          // new global high, the everBest-diff animation below will commit
-          // exactly the tiles that actually changed since the prior everBest.
           for (let i = 0; i < k; i++) {
             const t = candidates[Math.floor(Math.random() * candidates.length)];
             const steps = 1 + Math.floor(Math.random() * 5);
             t.rotDeg = t.rotDeg + steps * 60;
           }
-          colorize(); // silent: updates lastColorize only
+          colorize();
           currentScore = mode.score();
           perturbations++;
           sinceLast = 0;
@@ -352,7 +383,7 @@
           if (iters % 5 === 0) await new Promise(r => setTimeout(r, 0));
           continue;
         }
-        // ----- NORMAL TRIAL -----
+        // NORMAL TRIAL — logical only.
         const k = 1 + Math.floor(Math.random() * 3);
         const changes = [];
         for (let i = 0; i < k; i++) {
@@ -362,84 +393,17 @@
           t.rotDeg = prev + steps * 60;
           changes.push([t, prev]);
         }
-        colorize(); // silent: only computes lastColorize
+        colorize();
         const s = mode.score();
         if (s > currentScore) {
-          // v21: accepted trial is logical-only. DOM still shows everBest.
           currentScore = s;
           sinceLast = 0;
           if (s > everBest) {
-            // New global high — snapshot, then animate the diff between the
-            // currently-displayed config and the new everBest config. Only
-            // tiles whose displayed orientation differs from the new target
-            // get a rotation animation; everything else stays put.
             everBest = s;
             improvements++;
             for (const t of candidates) everBestRot.set(t, t.rotDeg);
-
-            // v22 (David, 2026-05-27): re-arming a tile that's still
-            // mid-rotation from a prior everBest must preserve the *constant
-            // on-screen angular velocity* (60°/450ms = 7.5 ms/deg). If we just
-            // overwrote `transform` with a new target, CSS would interpolate
-            // from the live visually-interpolated angle to the new target over
-            // the duration we requested — but the duration is computed from
-            // the snap-to-snap delta, not the live-visual-to-target delta, so
-            // any in-flight tile would speed up. Fix: for each in-flight tile,
-            // read its live visual angle, snap `transform` to that value with
-            // `transitionDuration: 0`, force a single batched reflow, THEN
-            // arm the new transition + write the new target. This guarantees
-            // every rotation animates at exactly MS_PER_DEG ms/deg.
-            const now2 = performance.now();
-            const startAngle = new Map(); // tile → angle to animate FROM
-            let anyInFlight = false;
-            for (const t of candidates) {
-              const target = t.rotDeg;
-              const shown = displayedRot.get(t);
-              if (shown === target) continue;
-              if (t.inner.__rotEndAt && t.inner.__rotEndAt > now2) {
-                // Live read of current interpolated angle (mod 360°).
-                startAngle.set(t, readVisualAngle(t.inner));
-                anyInFlight = true;
-              } else {
-                startAngle.set(t, shown);
-              }
-            }
-            // Snap pass for in-flight tiles: zero out the transition and write
-            // the current visual angle so the next style change starts from
-            // exactly where the eye is.
-            if (anyInFlight) {
-              for (const [t, va] of startAngle) {
-                if (t.inner.__rotEndAt && t.inner.__rotEndAt > now2) {
-                  t.inner.style.transitionDuration = "0ms";
-                  t.inner.style.transform = `rotate(${va}deg)`;
-                }
-              }
-              // Single batched reflow so the snap is realized before we arm
-              // the new transition.
-              document.body.getBoundingClientRect();
-            }
-            // Arm pass: shortest signed-equivalent rotation in (-180°,+180°].
-            // Duration = |delta| × MS_PER_DEG → constant 7.5 ms/deg.
-            for (const [t, start] of startAngle) {
-              const target = t.rotDeg;
-              const rawDelta = target - start;
-              const delta = ((rawDelta % 360) + 540) % 360 - 180;
-              if (delta === 0) {
-                // Differs from start by an exact multiple of 360° → visually
-                // identical, no animation needed.
-                displayedRot.set(t, target);
-                continue;
-              }
-              setRotateAnim(t.inner, delta);
-              const newShown = start + delta;
-              t.inner.style.transform = `rotate(${newShown}deg)`;
-              displayedRot.set(t, newShown);
-              rotationByCell.set(t.col + "," + t.row, ((newShown % 360) + 360) % 360);
-            }
-            updateModeBanner(modeIdx, everBest, "searching…");
           }
         } else {
-          // Revert logical state only — DOM was never touched on this trial.
           for (let i = changes.length - 1; i >= 0; i--) {
             const [t, prev] = changes[i];
             t.rotDeg = prev;
@@ -450,81 +414,62 @@
         if (iters % 5 === 0) await new Promise(r => setTimeout(r, 0));
       }
     } catch (err) {
-      // Safety: any unexpected throw inside the loop must not leave the page
-      // wedged with silentColorize=true (which would suppress every future
-      // ribbon fill update) or pulses halted forever. Reset both, then rethrow.
       silentColorize = false;
       pulsesHalted = false;
-      document.body.classList.remove("searching");
+      document.body.classList.remove("search-phase-out", "search-phase-spin", "search-phase-in");
       searching = false;
       throw err;
     }
-    // Note: silentColorize stays true here intentionally — see comment above.
 
-    // v21: the DOM has been showing the current everBest configuration
-    // throughout the search (display only updates on new everBest), so this
-    // step is normally a no-op. We still sync logical `t.rotDeg` to
-    // `everBestRot[t]` (which equals what's displayed mod 360°) so future
-    // searches start from a clean basin, and we keep an animated fallback
-    // in case anything drifted. Expected: `restored = 0` every run.
-    let restored = 0;
-    for (const t of candidates) {
-      const target = everBestRot.get(t);
-      const shown = displayedRot.get(t);
-      // Bring logical state back in line with the everBest snapshot.
-      t.rotDeg = target;
-      // Visual check: shown should already equal target mod 360°. Animate
-      // any residual diff as a safety net.
-      if (shown !== target) {
-        const rawDelta = target - shown;
-        const delta = ((rawDelta % 360) + 540) % 360 - 180;
-        if (delta === 0) {
-          displayedRot.set(t, target);
-          continue;
-        }
-        setRotateAnim(t.inner, delta);
-        const newShown = shown + delta;
-        t.inner.style.transform = `rotate(${newShown}deg)`;
-        displayedRot.set(t, newShown);
-        rotationByCell.set(t.col + "," + t.row, ((newShown % 360) + 360) % 360);
-        restored++;
-      }
-    }
-    // Final silent colorize: refreshes `lastColorize.strands` to match the
-    // everBest rotations without writing any ribbon fills.
+    // ----- PHASE C: hex tiles rotate to everBest + nodes slide home -----
+    // Sync logical state to everBest (in case the last accepted trial was at a
+    // score below everBest).
+    for (const t of candidates) t.rotDeg = everBestRot.get(t);
+    // Refresh lastColorize for the new everBest config (silent — no fills yet).
     colorize();
 
-    // Wait for any still-animating tile rotations (including the everBest
-    // restore animation which can be up to 300°=2250ms at constant angular
-    // velocity) to fully land before starting the color-flow sweep + pulse
-    // resume (David, 2026-05-26).
-    const settleWait = Math.max(0, lastRotateEndAt - performance.now());
-    if (settleWait > 0) await new Promise(r => setTimeout(r, settleWait));
+    // For each tile whose target differs from its pre-search displayed angle,
+    // compute the shortest signed-path delta and arm a rotation. Track the
+    // longest delta so we can sync the node-move-in to it.
+    let maxAnimMs = 0;
+    for (const t of candidates) {
+      const shown = preSearchRot.get(t);
+      const target = everBestRot.get(t);
+      const rawDelta = target - shown;
+      const delta = ((rawDelta % 360) + 540) % 360 - 180;
+      if (delta === 0) {
+        // Visually identical — keep DOM as-is, but normalize t.rotDeg to the
+        // displayed value so future operations stay consistent.
+        t.rotDeg = shown;
+        continue;
+      }
+      setRotateAnim(t.inner, delta);
+      const newShown = shown + delta;
+      t.inner.style.transform = `rotate(${newShown}deg)`;
+      rotationByCell.set(t.col + "," + t.row, ((newShown % 360) + 360) % 360);
+      // Restore invariant `t.rotDeg == displayed transform`.
+      t.rotDeg = newShown;
+      const animMs = Math.abs(delta) * (450 / 60); // MS_PER_DEG = 7.5
+      if (animMs > maxAnimMs) maxAnimMs = animMs;
+    }
+    const phaseInMs = Math.max(PHASE_C_MIN_MS, maxAnimMs);
+    document.body.style.setProperty("--phase-in-duration", phaseInMs + "ms");
+    document.body.classList.remove("search-phase-spin");
+    document.body.classList.add("search-phase-in");
 
-    // The radial-slide keyframes finish at translate(0,0) right as the
-    // animation duration elapses (matched to durationMs), so removing the
-    // `searching` class drops cleanly back to the resting state — no jump.
-    // Remove it now (BEFORE starting the color-flow) so the body.searching
-    // ribbon-transition override (500ms) doesn't fight the color-flowing
-    // override (60ms).
-    document.body.classList.remove("searching");
+    // Wait for phase C (longest tile rotation OR floor, whichever is larger).
+    await new Promise(r => setTimeout(r, phaseInMs));
+
+    // ----- PHASE D: ribbons + nodes color in; pulses ramp back up -----
+    document.body.classList.remove("search-phase-in");
     silentColorize = false;
-
-    // Color-flow sweep (David, 2026-05-26): color flows outward from each
-    // color node along its strand at one hex-length per 5ms. Pulses keep
-    // their colors (untouched). Fire-and-forget — runs in parallel with the
-    // pulse resume ramp.
     runColorFlow();
-
-    // Resume phase: pulses accelerate back to full speed over 500ms; emission
-    // resumes immediately (new pulses share `pulseSpeedScale` so they ramp up
-    // alongside the survivors).
     pulsesHalted = false;
     await rampPulseSpeed(0, 1, 500);
 
     searching = false;
     updateModeBanner(modeIdx, everBest, `${iters} trials, +${improvements}`);
-    console.log(`search mode=${modeIdx} (${mode.name}): iters=${iters} improvements=${improvements} perturbations=${perturbations} restored=${restored} score=${everBest}`);
+    console.log(`search v23 mode=${modeIdx} (${mode.name}): iters=${iters} improvements=${improvements} perturbations=${perturbations} phaseInMs=${phaseInMs.toFixed(0)} score=${everBest}`);
   }
 
   // ---------- Pulses ----------
@@ -945,7 +890,7 @@
   // ---------- Optimization-window ribbon animations ----------
   // David, 2026-05-26:
   //   • When an optimization starts, the ribbon paths (NOT the pulses) fade
-  //     to gray (BAND_FILL). The fade uses the body.searching .ribbon CSS
+  //     to gray (BAND_FILL). The fade uses the body.search-phase-* .ribbon CSS
   //     transition (500ms ease), matched to the pulse-halt ramp duration.
   //   • When the optimization finishes, color flows outward from each color
   //     node along its strand at one hex-length per 5ms. Pulses are untouched.
@@ -964,7 +909,7 @@
 
   function fadeRibbonsToGray() {
     // Reset every currently-colored ribbon arc to BAND_FILL. The CSS rule
-    // `body.searching .ribbon { transition: fill 500ms ease; }` smoothly
+    // `body.search-phase-* .ribbon { transition: fill 250ms ease; }` smoothly
     // animates the fade. We iterate `lastColorize.strands` (cheap — only
     // colored arcs) instead of scanning every tile.
     if (!lastColorize) return;
@@ -1421,7 +1366,7 @@
         // While a search is in flight, ignore taps on magic entirely.
         if (!searching) {
           currentMode = (currentMode + 1) % MODES.length;
-          searchBestConfig(3000, currentMode);
+          searchBestConfig(1000, currentMode);
         }
       } else {
         rotateTile(drag.startTile);
